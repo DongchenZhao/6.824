@@ -22,8 +22,16 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+// MsgReq RPC定义
+type MsgReq struct {
+	Type    string
+	Content []string
+}
 
+type MsgRes struct {
+	Type    string
+	Content []string
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

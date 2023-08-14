@@ -193,7 +193,7 @@ $TIMEOUT ../mrcoordinator ../pg*txt &
 sleep 1
 
 $TIMEOUT ../mrworker ../../mrapps/jobcount.so &
-$TIMEOUT ../mrworker ../../mrapps/jobcount.so
+$TIMEOUT ../mrworker ../../mrapps/jobcount.so &
 $TIMEOUT ../mrworker ../../mrapps/jobcount.so &
 $TIMEOUT ../mrworker ../../mrapps/jobcount.so
 
