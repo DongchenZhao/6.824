@@ -19,6 +19,7 @@ package raft
 
 import (
 	"log"
+	"math/rand"
 	"time"
 
 	//	"bytes"
@@ -81,10 +82,16 @@ type Raft struct {
 	matchIndex []int
 
 	// ------ other ------
-	role                int // 0: follower, 1: candidate, 2: leader
-	lastHeartbeatTime   int64
-	lastHeartbeatTimeMu sync.RWMutex
-	electionTimeout     int64
+	role              int // 0: follower, 1: candidate, 2: leader
+	lastHeartbeatTime int64
+	electionTimeout   int
+
+	// ------ other locks ------
+	roleLock              sync.RWMutex
+	lastHeartbeatTimeLock sync.RWMutex
+	currentTermLock       sync.RWMutex
+	logLock               sync.RWMutex
+	voteForLock           sync.RWMutex
 }
 
 // return currentTerm and whether this server
@@ -94,10 +101,14 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.currentTermLock.RLock()
 	term = rf.currentTerm
+	rf.currentTermLock.RUnlock()
+
+	rf.roleLock.RLock()
 	isleader = rf.role == 2
+	rf.roleLock.RUnlock()
+
 	return term, isleader
 }
 
@@ -157,18 +168,80 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// an RPC handler should ignore RPCs with old terms
+
+	rf.currentTermLock.RLock()
+	currentTerm := rf.currentTerm
+	rf.currentTermLock.RUnlock()
+	rf.voteForLock.RLock()
+	votedFor := rf.votedFor
+	rf.voteForLock.RUnlock()
+
+	//// 如果自己是term更小的leader，转为follower
+	//if rf.role == 2 && args.term < currentTerm {
+	//	// leader 转为follower, 重置lastHeartbeatTime
+	//	// scenario: leader被网络分区，分区愈合之后之后遇到选举
+	//	// 但这种情况下leader应该由于AppendEntries RPC的失败而转为follower
+	//	rf.roleLock.Lock()
+	//	rf.role = 0
+	//	rf.roleLock.Unlock()
+	//  // 更新自己的term
+	//
+	//	rf.lastHeartbeatTimeLock.Lock()
+	//	rf.lastHeartbeatTime = time.Now().UnixMilli()
+	//	rf.lastHeartbeatTimeLock.Unlock()
+	//}
+
+	// 1.如果自己有更大的term，拒绝投票
+	// 2.如果自己已经投过票，也拒绝投票
+	// 3.如果自己日志更新，也拒绝投票
+	// 隐含了自己是term更大的leader的情况
+	if args.Term < currentTerm || votedFor != -1 {
+		reply.Term = currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	// TODO 自己的log更新，拒绝投票
+
+	// 同意投票
+	// 1.更新自己的term
+	// 2.更新自己的voteFor
+	rf.currentTermLock.Lock()
+	rf.currentTerm = args.Term
+	rf.currentTermLock.Unlock()
+
+	rf.voteForLock.Lock()
+	rf.votedFor = args.CandidateId
+	rf.voteForLock.Unlock()
+
+	reply.Term = args.Term
+	reply.VoteGranted = true
+}
+
+func (rf *Raft) requestVoteRespHandler(reply *RequestVoteReply) {
+	// TODO handle requestVoteResponse
+
+	// 忽略过期term的RPC reply
+
+	// 统计票数
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -268,6 +341,9 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
+// follower或candidate
+// 定期检查是否heartbeat超时，如果当前server认为自己是leader，那么就不需要进行选举
+// 否则在electionTimeout时间内没有收到心跳包，就开始选举
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
@@ -275,17 +351,78 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 
-		time.Sleep(10 * time.Millisecond)
-		rf.lastHeartbeatTimeMu.RLocker()
-		if rf.lastHeartbeatTime < time.Now().UnixNano()/int64(time.Millisecond)-150 {
-			rf.lastHeartbeatTimeMu.RUnlock()
-			rf.mu.Lock()
-			rf.role = 1
-			rf.mu.Unlock()
-			// go rf.election() // election timer
-		} else {
-			rf.lastHeartbeatTimeMu.RUnlock()
+		// 如果当前角色是leader，那么就不需要进行选举
+		rf.roleLock.RLock()
+		role := rf.role
+		rf.roleLock.RUnlock()
+		if role == 2 {
+			continue
 		}
+		// 如果距离上次收到心跳包的时间超过了electionTimeout，那么就需要进行选举
+		rf.lastHeartbeatTimeLock.RLock()
+		lastHeartbeatTime := rf.lastHeartbeatTime
+		rf.lastHeartbeatTimeLock.RUnlock()
+		if lastHeartbeatTime < time.Now().UnixMilli()-int64(rf.electionTimeout) {
+			rf.startElection()
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// follower或candidate 超时未收到心跳触发
+// 0. role设置为2
+// 1. 增加currentTerm
+// 2. voteFor设置为自己
+// 3. 重置lastHeartbeatTime
+// 4. 向其他server发送RequestVote RPC
+func (rf *Raft) startElection() {
+	// 超时，改变角色，重置voteFor，开始选举
+	log.Printf("Server No.%d start election", rf.me)
+	rf.roleLock.Lock()
+	rf.role = 1
+	rf.roleLock.Unlock()
+
+	// 更新term
+	rf.currentTermLock.Lock()
+	rf.currentTerm++
+	rf.currentTermLock.Unlock()
+
+	// 为自己投票
+	rf.voteForLock.Lock()
+	rf.votedFor = rf.me
+	rf.voteForLock.Unlock()
+
+	// 重置lastHeartbeatTime
+	rf.lastHeartbeatTimeLock.Lock()
+	rf.lastHeartbeatTime = time.Now().UnixMilli()
+	rf.lastHeartbeatTimeLock.Unlock()
+
+	// 获取当前term，me，lastLogIndex，lastLogTerm，这些都是需要发送给其他server的，对这些数据快照，以防不同server收到不同数据
+	rf.currentTermLock.RLock()
+	currentTerm := rf.currentTerm
+	rf.currentTermLock.RUnlock()
+	me := rf.me
+	rf.logLock.RLock()
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
+	rf.logLock.RUnlock()
+
+	// 遍历rf的peer，并发地向每个peer发送RequestVote RPC
+	for i := 0; i < len(rf.peers); i++ {
+		curI := i
+		go func() {
+			if curI == rf.me { // 跳过自己
+				return
+			}
+			log.Printf("Server No.%d send RequestVote RPC to server No.%d", rf.me, curI)
+			requestVoteArgs := RequestVoteArgs{currentTerm, me, lastLogTerm, lastLogTerm}
+			requestVoteReply := RequestVoteReply{}
+			ok := rf.sendRequestVote(curI, &requestVoteArgs, &requestVoteReply)
+			if !ok {
+				log.Printf("\033[31mServer No.%d send RequestVote RPC to server No.%d failed\033[0m", rf.me, curI)
+			}
+			rf.requestVoteRespHandler(&requestVoteReply)
+		}()
 	}
 }
 
@@ -306,12 +443,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
 	log.Printf("Starting server No.%d", rf.me)
+
+	//初始化一些field，这里不考虑并发问题
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = make([]LogEntry, 0)
+
 	// 初始化lastHeartbeatTime，设置为当前时间的毫秒数
-	rf.lastHeartbeatTimeMu.Lock()
-	rf.lastHeartbeatTime = time.Now().UnixNano() / int64(time.Millisecond)
-	rf.lastHeartbeatTimeMu.Unlock()
+	rf.lastHeartbeatTimeLock.Lock()
+	rf.lastHeartbeatTime = time.Now().UnixMilli()
+	rf.lastHeartbeatTimeLock.Unlock()
+
+	// 初始化electionTimeout，设置为500-800ms之间的随机数
+	rf.electionTimeout = 500 + rand.Intn(300)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

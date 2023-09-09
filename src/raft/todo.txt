@@ -1,3 +1,11 @@
 - 心跳 0.15秒
 - follower timeout 和 election timeout 0.5-0.8秒，随机
 
+对于一个Raft server，并行体现在以下方面
+- follower的心跳检测routine，拥有心跳超时逻辑
+- follower并行处理RequestVote RPC
+- candidate的选举超时routine
+- candidate并行发送RequestVote RPC
+- leader的心跳routine
+- leader并行发送AppendEntries RPC
+- 向客户端发送applyChs的routine(Cond)
