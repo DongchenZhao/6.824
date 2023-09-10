@@ -85,13 +85,17 @@ type Raft struct {
 	role              int // 0: follower, 1: candidate, 2: leader
 	lastHeartbeatTime int64
 	electionTimeout   int
+	voteCnt           int
+	curLeader         int
 
-	// ------ other locks ------
+	// ------ locks ------
 	roleLock              sync.RWMutex
 	lastHeartbeatTimeLock sync.RWMutex
 	currentTermLock       sync.RWMutex
 	logLock               sync.RWMutex
 	voteForLock           sync.RWMutex
+	voteCntLock           sync.RWMutex
+	curLeaderLock         sync.RWMutex
 }
 
 // return currentTerm and whether this server
@@ -187,6 +191,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// an RPC handler should ignore RPCs with old terms
 
+	// 更新时钟
+	rf.lastHeartbeatTimeLock.Lock()
+	rf.lastHeartbeatTime = time.Now().UnixMilli()
+	rf.lastHeartbeatTimeLock.Unlock()
+
 	rf.currentTermLock.RLock()
 	currentTerm := rf.currentTerm
 	rf.currentTermLock.RUnlock()
@@ -194,20 +203,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	votedFor := rf.votedFor
 	rf.voteForLock.RUnlock()
 
-	//// 如果自己是term更小的leader，转为follower
-	//if rf.role == 2 && args.term < currentTerm {
-	//	// leader 转为follower, 重置lastHeartbeatTime
-	//	// scenario: leader被网络分区，分区愈合之后之后遇到选举
-	//	// 但这种情况下leader应该由于AppendEntries RPC的失败而转为follower
-	//	rf.roleLock.Lock()
-	//	rf.role = 0
-	//	rf.roleLock.Unlock()
-	//  // 更新自己的term
-	//
-	//	rf.lastHeartbeatTimeLock.Lock()
-	//	rf.lastHeartbeatTime = time.Now().UnixMilli()
-	//	rf.lastHeartbeatTimeLock.Unlock()
-	//}
+	// 如果自己term更小，无论自己是哪种身份，转为follower，然后刷新term和voteFor
+	if args.Term > currentTerm {
+		rf.toFollower(args.Term)
+		currentTerm = args.Term
+		votedFor = -1
+	}
 
 	// 1.如果自己有更大的term，拒绝投票
 	// 2.如果自己已经投过票，也拒绝投票
@@ -222,26 +223,52 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// TODO 自己的log更新，拒绝投票
 
 	// 同意投票
-	// 1.更新自己的term
-	// 2.更新自己的voteFor
-	rf.currentTermLock.Lock()
-	rf.currentTerm = args.Term
-	rf.currentTermLock.Unlock()
-
+	// 隐含条件是自己term和requestVoteArgs.Term相等
+	// 更新voteFor
 	rf.voteForLock.Lock()
+	defer rf.voteForLock.Unlock()
+
 	rf.votedFor = args.CandidateId
-	rf.voteForLock.Unlock()
 
 	reply.Term = args.Term
 	reply.VoteGranted = true
+	log.Printf("Server No.%d vote for server No.%d", rf.me, args.CandidateId)
 }
 
 func (rf *Raft) requestVoteRespHandler(reply *RequestVoteReply) {
-	// TODO handle requestVoteResponse
+
+	// 自己不是candidate了，忽略reply
+	rf.roleLock.RLock()
+	role := rf.role
+	rf.roleLock.RUnlock()
+	if role != 1 {
+		return
+	}
 
 	// 忽略过期term的RPC reply
+	rf.currentTermLock.RLock()
+	currentTerm := rf.currentTerm
+	rf.currentTermLock.RUnlock()
+	if reply.Term < currentTerm {
+		return
+	}
 
-	// 统计票数
+	// 处理reply.VoteGranted false的情况
+	if !reply.VoteGranted && reply.Term > currentTerm {
+		rf.toFollower(reply.Term)
+		return
+	}
+
+	// 得到批准投票，统计票数
+	if reply.VoteGranted {
+		rf.voteCntLock.Lock()
+		rf.voteCnt++
+		voteCnt := rf.voteCnt
+		rf.voteCntLock.Unlock()
+		if voteCnt > len(rf.peers)/2 { // 获得大多数选票，成为leader
+			rf.toLeader()
+		}
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -291,11 +318,34 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.currentTermLock.RLock()
+	currentTerm := rf.currentTerm
+	rf.currentTermLock.RUnlock()
+	if args.Term < currentTerm { // 过期leader，拒绝
+		log.Printf("\u001B[31mServer No.%d reject AppendEntries RPC from leader No.%d\u001B[0m", rf.me, args.LeaderId)
+		reply.Term = currentTerm
+		reply.Success = false
+	} else { // leader term更大，或两者相等，转为follower（即使当前role已经是follower）
+		rf.toFollower(args.Term)
+		reply.Term = args.Term
+		reply.Success = true
+	}
+}
 
+// 处理AppendEntries RPC的reply
+func (rf *Raft) appendEntriesRespHandler(reply *AppendEntriesReply) {
+	rf.currentTermLock.RLock()
+	currentTerm := rf.currentTerm
+	rf.currentTermLock.RUnlock()
+
+	if reply.Term > currentTerm { // 过期leader，转为follower
+		rf.toFollower(reply.Term)
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	return true
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -351,7 +401,9 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 
-		// 如果当前角色是leader，那么就不需要进行选举
+		time.Sleep(10 * time.Millisecond)
+
+		// 如果当前角色是leader，那么就不需要听心跳
 		rf.roleLock.RLock()
 		role := rf.role
 		rf.roleLock.RUnlock()
@@ -363,51 +415,53 @@ func (rf *Raft) ticker() {
 		lastHeartbeatTime := rf.lastHeartbeatTime
 		rf.lastHeartbeatTimeLock.RUnlock()
 		if lastHeartbeatTime < time.Now().UnixMilli()-int64(rf.electionTimeout) {
-			rf.startElection()
+			rf.toCandidate()
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 // follower或candidate 超时未收到心跳触发
-// 0. role设置为2
+// 0. role设置为1
 // 1. 增加currentTerm
 // 2. voteFor设置为自己
 // 3. 重置lastHeartbeatTime
 // 4. 向其他server发送RequestVote RPC
-func (rf *Raft) startElection() {
+func (rf *Raft) toCandidate() {
 	// 超时，改变角色，重置voteFor，开始选举
 	log.Printf("Server No.%d start election", rf.me)
 	rf.roleLock.Lock()
 	rf.role = 1
-	rf.roleLock.Unlock()
+	defer rf.roleLock.Unlock()
 
 	// 更新term
 	rf.currentTermLock.Lock()
 	rf.currentTerm++
-	rf.currentTermLock.Unlock()
+	currentTerm := rf.currentTerm
+	defer rf.currentTermLock.Unlock()
 
 	// 为自己投票
 	rf.voteForLock.Lock()
 	rf.votedFor = rf.me
-	rf.voteForLock.Unlock()
+	defer rf.voteForLock.Unlock()
 
 	// 重置lastHeartbeatTime
 	rf.lastHeartbeatTimeLock.Lock()
 	rf.lastHeartbeatTime = time.Now().UnixMilli()
-	rf.lastHeartbeatTimeLock.Unlock()
+	defer rf.lastHeartbeatTimeLock.Unlock()
 
 	// 获取当前term，me，lastLogIndex，lastLogTerm，这些都是需要发送给其他server的，对这些数据快照，以防不同server收到不同数据
-	rf.currentTermLock.RLock()
-	currentTerm := rf.currentTerm
-	rf.currentTermLock.RUnlock()
 	me := rf.me
 	rf.logLock.RLock()
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
+	// TODO lab 2B
+	//lastLogIndex := len(rf.log) - 1
+	//lastLogTerm := rf.log[lastLogIndex].Term
+	lastLogIndex := 0
+	lastLogTerm := currentTerm
 	rf.logLock.RUnlock()
 
 	// 遍历rf的peer，并发地向每个peer发送RequestVote RPC
+	//println(555)
+
 	for i := 0; i < len(rf.peers); i++ {
 		curI := i
 		go func() {
@@ -415,7 +469,7 @@ func (rf *Raft) startElection() {
 				return
 			}
 			log.Printf("Server No.%d send RequestVote RPC to server No.%d", rf.me, curI)
-			requestVoteArgs := RequestVoteArgs{currentTerm, me, lastLogTerm, lastLogTerm}
+			requestVoteArgs := RequestVoteArgs{currentTerm, me, lastLogIndex, lastLogTerm}
 			requestVoteReply := RequestVoteReply{}
 			ok := rf.sendRequestVote(curI, &requestVoteArgs, &requestVoteReply)
 			if !ok {
@@ -423,6 +477,96 @@ func (rf *Raft) startElection() {
 			}
 			rf.requestVoteRespHandler(&requestVoteReply)
 		}()
+	}
+}
+
+// leader/candidate/follower发现自己term小于RPC中的term
+// 转为follower，重置lastHeartbeatTime
+// 如果term更新，重置voteFor，currentTerm，voteCnt
+func (rf *Raft) toFollower(term int) {
+	rf.currentTermLock.RLock()
+	currentTerm := rf.currentTerm
+	rf.currentTermLock.RUnlock()
+
+	// 重置一些状态
+	rf.roleLock.Lock()
+	defer rf.roleLock.Unlock()
+	rf.currentTermLock.Lock()
+	defer rf.currentTermLock.Unlock()
+	rf.lastHeartbeatTimeLock.Lock()
+	defer rf.lastHeartbeatTimeLock.Unlock()
+	rf.voteForLock.Lock()
+	defer rf.voteForLock.Unlock()
+	rf.voteCntLock.Lock()
+	defer rf.voteCntLock.Unlock()
+
+	rf.role = 0
+	rf.lastHeartbeatTime = time.Now().UnixMilli()
+	if currentTerm != term {
+		rf.currentTerm = term
+		rf.votedFor = -1
+		rf.voteCnt = 0
+	}
+}
+
+func (rf *Raft) toLeader() {
+
+	log.Printf("Server No.%d become leader", rf.me)
+	// 重置一些状态
+	rf.roleLock.Lock()
+	defer rf.roleLock.Unlock()
+	rf.lastHeartbeatTimeLock.Lock()
+	defer rf.lastHeartbeatTimeLock.Unlock()
+	rf.voteForLock.Lock()
+	defer rf.voteForLock.Unlock()
+	rf.voteCntLock.Lock()
+	defer rf.voteCntLock.Unlock()
+	rf.currentTermLock.Lock()
+	defer rf.currentTermLock.Unlock()
+
+	rf.role = 2
+	rf.lastHeartbeatTime = time.Now().UnixMilli()
+	rf.votedFor = -1
+	rf.voteCnt = 0
+	rf.curLeader = rf.me
+	// 启动go routine，定期发送心跳包
+	go rf.leaderTick()
+
+}
+
+func (rf *Raft) leaderTick() {
+	for rf.killed() == false {
+		rf.roleLock.RLock()
+		role := rf.role
+		rf.roleLock.RUnlock()
+		rf.currentTermLock.RLock()
+		currentTerm := rf.currentTerm
+		rf.currentTermLock.RUnlock()
+		if role != 2 { // 不再是leader，结束这个go routine
+			log.Printf("Server No.%d is no longer leader", rf.me)
+			return
+		}
+		// 并发发送心跳包
+		for i := 0; i < len(rf.peers); i++ {
+			curI := i
+			go func() {
+				if curI == rf.me { // 跳过自己
+					return
+				}
+				// log.Printf("Server No.%d send heartbeat to server No.%d", rf.me, curI)
+				appendEntriesArgs := AppendEntriesArgs{currentTerm, rf.me, 0, 0, nil, 0}
+				appendEntriesReply := AppendEntriesReply{}
+				log.Printf("leader No.%d send heartbeat to server No.%d", rf.me, curI)
+				ok := rf.sendAppendEntries(curI, &appendEntriesArgs, &appendEntriesReply)
+				if !ok {
+					log.Printf("\033[31mServer No.%d send heartbeat to server No.%d failed\033[0m", rf.me, curI)
+				}
+				// 处理心跳包的reply
+				rf.appendEntriesRespHandler(&appendEntriesReply)
+			}()
+		}
+
+		time.Sleep(150 * time.Millisecond)
 	}
 }
 
@@ -449,11 +593,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = make([]LogEntry, 0)
+	//
+	//// 初始化lastHeartbeatTime，设置为当前时间的毫秒数
+	//rf.lastHeartbeatTimeLock.Lock()
+	//rf.lastHeartbeatTime = time.Now().UnixMilli()
+	//rf.lastHeartbeatTimeLock.Unlock()
 
-	// 初始化lastHeartbeatTime，设置为当前时间的毫秒数
-	rf.lastHeartbeatTimeLock.Lock()
-	rf.lastHeartbeatTime = time.Now().UnixMilli()
-	rf.lastHeartbeatTimeLock.Unlock()
+	rf.toFollower(0)
 
 	// 初始化electionTimeout，设置为500-800ms之间的随机数
 	rf.electionTimeout = 500 + rand.Intn(300)

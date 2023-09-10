@@ -9,3 +9,7 @@
 - leader的心跳routine
 - leader并行发送AppendEntries RPC
 - 向客户端发送applyChs的routine(Cond)
+
+
+  ... Passed --   8.1  7  474   89208    0
+PASS
