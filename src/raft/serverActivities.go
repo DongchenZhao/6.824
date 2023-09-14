@@ -37,7 +37,7 @@ func (rf *Raft) toCandidate() {
 	// 获取当前term，me，lastLogIndex，lastLogTerm，这些都是需要发送给其他server的，对这些数据快照，以防不同server收到不同数据
 	me := rf.me
 	rf.logLock.RLock()
-	// TODO lab 2B
+	// TODO lab 2B election restriction
 	//lastLogIndex := len(rf.log) - 1
 	//lastLogTerm := rf.log[lastLogIndex].Term
 	lastLogIndex := 0
@@ -116,6 +116,8 @@ func (rf *Raft) toLeader() {
 	rf.votedFor = -1
 	rf.voteCnt = 0
 	rf.curLeader = rf.me
+	// TODO
+
 	// 启动go routine，定期发送心跳包
 	go rf.leaderTick()
 

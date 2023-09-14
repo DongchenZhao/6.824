@@ -1,3 +1,4 @@
+2A----------------------------------
 - 心跳 0.15秒
 - follower timeout 和 election timeout 0.5-0.8秒，随机
 
@@ -13,3 +14,35 @@
 
   ... Passed --   8.1  7  474   89208    0
 PASS
+
+
+2B-----------------------------------
+- leader state
+    - nextIndex[]: for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+    - matchIndex[]: for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+
+- server state
+    - lastApplied: index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+    - commitIndex: index of highest log entry known to be committed (initialized to 0, increases monotonically)
+
+- requestVoteRPC
+    - lastLogIndex: index of candidate’s last log entry
+    - lastLogTerm: term of candidate’s last log entry
+
+- appendEntriesRPC
+    - prevLogIndex: index of log entry immediately preceding new ones
+    - prevLogTerm: term of prevLogIndex entry
+    - entries[]: log entries to store (empty for heartbeat; may send more than one for efficiency)
+    - leaderCommit: leader’s commitIndex
+
+- election restriction
+    - 更改RequestVoteRPC
+    - candidate has higher term in last log entry, or
+    - candidate has same last term and same length or longer log
+
+- leader只commit自己term的log entry(Figure 8)
+
+- log 复制优化: requestVoteRPC返回内容增加以下字段
+    - XTerm:  term in the conflicting entry (if any)
+    - XIndex: index of first entry with that term (if any)
+    - XLen:   log length

@@ -89,13 +89,15 @@ type Raft struct {
 	curLeader         int
 
 	// ------ locks ------
+	// ------2A ------
 	roleLock              sync.RWMutex
 	lastHeartbeatTimeLock sync.RWMutex
 	currentTermLock       sync.RWMutex
-	logLock               sync.RWMutex
 	voteForLock           sync.RWMutex
 	voteCntLock           sync.RWMutex
 	curLeaderLock         sync.RWMutex
+	// ------2B ------
+	logLock sync.RWMutex
 }
 
 // return currentTerm and whether this server
