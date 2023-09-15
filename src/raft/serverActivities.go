@@ -181,14 +181,34 @@ func (rf *Raft) leaderTick() {
 			// PrintLog("No longer leader", "green", strconv.Itoa(rf.me))
 			return
 		}
+
+		//rf.matchIndexLock.RLock()
+		//matchIndex := make([]int, len(rf.matchIndex))
+		//copy(matchIndex, rf.matchIndex)
+		//rf.matchIndexLock.RUnlock()
+		rf.nextIndexLock.RLock()
+		nextIndex := make([]int, len(rf.nextIndex))
+		copy(nextIndex, rf.nextIndex)
+		rf.nextIndexLock.Unlock()
+		rf.commitIndexLock.RLock()
+		leaderCommit := rf.commitIndex
+		rf.commitIndexLock.RUnlock()
+
 		// 并发发送心跳包
 		for i := 0; i < len(rf.peers); i++ {
 			curI := i
 			go func() {
-				if curI == rf.me { // 跳过自己
+				// 跳过自己
+				if curI == rf.me {
 					return
 				}
-				appendEntriesArgs := AppendEntriesArgs{currentTerm, rf.me, 0, 0, nil, 0}
+				//获取要发送的prevLogIndex和prevLogTerm
+				prevLogIndex := nextIndex[curI] - 1
+				rf.logLock.RLock()
+				prevLogTerm := rf.log[prevLogIndex].Term
+				rf.logLock.RUnlock()
+
+				appendEntriesArgs := AppendEntriesArgs{currentTerm, rf.me, prevLogIndex, prevLogTerm, nil, leaderCommit}
 				appendEntriesReply := AppendEntriesReply{}
 				PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
 				ok := rf.sendAppendEntries(curI, &appendEntriesArgs, &appendEntriesReply)
@@ -202,4 +222,97 @@ func (rf *Raft) leaderTick() {
 
 		time.Sleep(150 * time.Millisecond)
 	}
+}
+
+// 匹配leader AE RPC中的prevLogIndex 和 prevLogTerm同当前rf log的情况
+// 1.rf的log在prevLogIndex位置没有条目，返回(false, -1, len(rf.log), len(rf.log))
+// 2.rf的log在prevLogIndex位置term冲突，返回(false, rf.log[prevLogIndex].Term, XIndex, XLen) leader需要在自己日志中对rf这个位置上的term进行搜索，根据leader是否有这个rf的这个term串来执行不同的操作
+// 此外，在2的情况下，rf需要截断日志
+// 3.匹配成功，append entries
+func (rf *Raft) compareAndHandleLog(prevLogIndex int, prevLogTerm int, entries []LogEntry, leaderCommit int) (bool, int, int, int) {
+	XTerm := -1
+	XIndex := -1
+	XLen := 0
+
+	// 对rf.log进行拷贝，但新切片元素中，只包含Term, 因为在2情况下进行了日志截断，所以这里需要深拷贝
+	rf.logLock.RLock()
+	log := make([]LogEntry, len(rf.log))
+	for i := 0; i < len(rf.log); i++ {
+		log[i].Term = rf.log[i].Term
+	}
+	rf.logLock.RUnlock()
+
+	// 当前server log长度不够，XTerm = -1, XIndex=Len(rf.log) leader下次会尝试匹配rf的最后一条日志
+	if len(log)-1 < prevLogIndex {
+		XTerm, XIndex, XLen = -1, len(log), len(log)
+		PrintLog("log compare failed, current server's log is too short", "blue", strconv.Itoa(rf.me))
+		rf.PrintRaftLog()
+		return false, XTerm, XIndex, XLen
+	}
+
+	// 匹配失败，leader需要将nextIndex移动越过当前server冲突term的所有entry
+	// If a follower does have prevLogIndex in its log, but the term does not match,
+	// it should return conflictTerm = log[prevLogIndex].Term,
+	// and then search its log for the first index whose entry has term equal to conflictTerm.
+	// 此外，在这种日志部匹配的情况下，rf需要截断日志
+	if log[prevLogIndex].Term != prevLogTerm {
+		XTerm, XIndex, XLen = rf.getXLogInfo(prevLogIndex)
+		PrintLog("log compare failed, not match at prevLogIndex", "blue", strconv.Itoa(rf.me))
+		rf.PrintRaftLog()
+		// 截断日志
+		rf.logLock.Lock()
+		defer rf.logLock.RUnlock()
+		rf.log = rf.log[:prevLogIndex]
+		return false, XTerm, XIndex, XLen
+	}
+
+	// 匹配成功，但rf日志可能过长
+	// 过长部分会直接被entries覆盖
+	if log[prevLogIndex].Term == prevLogTerm {
+		rf.logLock.Lock()
+		defer rf.logLock.Unlock()
+		rf.log = append(log[:prevLogIndex+1], entries...)
+		// set leaderCommit
+		rf.commitIndexLock.Lock()
+		defer rf.commitIndexLock.Unlock()
+		if leaderCommit > rf.commitIndex {
+			// rf.commitIndex = int(math.Min(leaderCommit, len(rf.log)-1))
+		}
+		return true, XTerm, XIndex, XLen
+	}
+
+	PrintLog("log compare error, unknown error", "red", strconv.Itoa(rf.me))
+	return false, XTerm, XIndex, XLen
+}
+
+// 获取当前server log指定index的最后一组term的第一条log的index和len
+func (rf *Raft) getXLogInfo(index int) (int, int, int) {
+	XTerm := -1
+	XIndex := 0
+	XLen := 0
+
+	rf.logLock.RLock()
+	defer rf.logLock.RUnlock()
+
+	// 日志长度为0
+	if len(rf.log) == 0 {
+		return XTerm, XIndex, XLen
+	}
+
+	// index为-1的时候，返回当前server最后一串term的第一个entry信息
+	i := index
+	if index == -1 {
+		i = len(rf.log) - 1
+	}
+	XTerm = rf.log[i].Term
+	for i != 0 {
+		if rf.log[i].Term != XTerm {
+			XIndex = i + 1
+			XLen = len(rf.log) - XIndex
+			return XTerm, XIndex, XLen
+		}
+		i--
+	}
+	// 日志只有一个term串
+	return XTerm, i, len(rf.log)
 }

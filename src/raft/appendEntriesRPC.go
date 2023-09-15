@@ -17,6 +17,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 func (rf *Raft) AppendEntriesReqHandler(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -27,11 +30,17 @@ func (rf *Raft) AppendEntriesReqHandler(args *AppendEntriesArgs, reply *AppendEn
 		PrintLog(fmt.Sprintf("Reject AppendEntries RPC from [Leader %d]", args.LeaderId), "yellow", strconv.Itoa(rf.me))
 		reply.Term = currentTerm
 		reply.Success = false
-	} else { // leader term更大，或两者相等，转为follower（即使当前role已经是follower）
+	} else {
+		// leader term更大，或两者相等，转为follower（即使当前role已经是follower）
 		// 转化为follower的时候重置了election timer，但上面拒绝leader不会重置election timer
+		// 此时，即使Success=false也不会使leader转为follower，只表示rf和leader日志不匹配
 		rf.toFollower(args.Term)
 		reply.Term = args.Term
-		reply.Success = true
+
+		// log replication part
+		compareSuccess, XTerm, XIndex, XLen := rf.compareAndHandleLog(args.PrevLogTerm, args.PrevLogIndex)
+		reply.Success = compareSuccess
+
 	}
 }
 

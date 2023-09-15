@@ -95,9 +95,10 @@ type Raft struct {
 	voteCntLock           sync.RWMutex
 	curLeaderLock         sync.RWMutex
 	// ------2B ------
-	logLock        sync.RWMutex
-	nextIndexLock  sync.RWMutex
-	matchIndexLock sync.RWMutex
+	logLock         sync.RWMutex
+	nextIndexLock   sync.RWMutex
+	matchIndexLock  sync.RWMutex
+	commitIndexLock sync.RWMutex
 }
 
 // return currentTerm and whether this server
@@ -139,7 +140,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logLock.RLock()
 		defer rf.logLock.RUnlock()
 		index = len(rf.log) + 1
-		//TODO send AE RPC to followers
+		// TODO send AE RPC to followers
+
 	}
 
 	return index, term, isLeader
