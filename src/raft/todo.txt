@@ -46,3 +46,13 @@ PASS
     - XTerm:  term in the conflicting entry (if any)
     - XIndex: index of first entry with that term (if any)
     - XLen:   log length
+
+- lastApplied 和 commitIndex
+    - 要么单开一个go routine来 apply log
+    - 避免线程并发apply log
+
+- 加速日志回溯优化
+    - If a follower does not have prevLogIndex in its log, it should return with conflictIndex = len(log) and conflictTerm = None.
+    - If a follower does have prevLogIndex in its log, but the term does not match, it should return conflictTerm = log[prevLogIndex].Term, and then search its log for the first index whose entry has term equal to conflictTerm.
+    - Upon receiving a conflict response, the leader should first search its log for conflictTerm. If it finds an entry in its log with that term, it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
+    - If it does not find an entry with that term, it should set nextIndex = conflictIndex.

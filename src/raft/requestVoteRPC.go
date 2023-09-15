@@ -24,7 +24,7 @@ type RequestVoteReply struct {
 }
 
 // example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVoteReqHandler(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// an RPC handler should ignore RPCs with old terms
 
@@ -52,20 +52,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// TODO 自己的log更新，拒绝投票
+	// TODO 自己的log更新，拒绝投票(election restriction)
 
 	// 同意投票
 	// 隐含条件是自己term和requestVoteArgs.Term相等（上面currentTerm更小的时候已经和candidate的term同步了）
 	// 更新voteFor和时钟
 	rf.voteForLock.Lock()
 	defer rf.voteForLock.Unlock()
+	rf.votedFor = args.CandidateId
 
-	// 只有决定投票的时候才更新时钟（https://thesquareplanet.com/blog/students-guide-to-raft/）
+	// 只有确定投票(而不是拒绝投票)的时候才更新时钟（https://thesquareplanet.com/blog/students-guide-to-raft/）
 	rf.lastHeartbeatTimeLock.Lock()
 	rf.lastHeartbeatTime = time.Now().UnixMilli()
 	rf.lastHeartbeatTimeLock.Unlock()
-
-	rf.votedFor = args.CandidateId
 
 	reply.Term = args.Term
 	reply.VoteGranted = true
@@ -136,6 +135,6 @@ func (rf *Raft) requestVoteRespHandler(reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	ok := rf.peers[server].Call("Raft.RequestVoteReqHandler", args, reply)
 	return ok
 }

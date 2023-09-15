@@ -20,8 +20,6 @@ package raft
 import (
 	"math/rand"
 	"strconv"
-	"time"
-
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -97,7 +95,9 @@ type Raft struct {
 	voteCntLock           sync.RWMutex
 	curLeaderLock         sync.RWMutex
 	// ------2B ------
-	logLock sync.RWMutex
+	logLock        sync.RWMutex
+	nextIndexLock  sync.RWMutex
+	matchIndexLock sync.RWMutex
 }
 
 // return currentTerm and whether this server
@@ -132,10 +132,15 @@ func (rf *Raft) GetState() (int, bool) {
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
-	term := -1
-	isLeader := true
 
 	// Your code here (2B).
+	term, isLeader := rf.GetState()
+	if isLeader {
+		rf.logLock.RLock()
+		defer rf.logLock.RUnlock()
+		index = len(rf.log) + 1
+		//TODO send AE RPC to followers
+	}
 
 	return index, term, isLeader
 }
@@ -157,72 +162,6 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
-}
-
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
-// follower或candidate
-// 定期检查是否heartbeat超时，如果当前server认为自己是leader，那么就不需要进行选举
-// 否则在electionTimeout时间内没有收到心跳包，就开始选举
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
-
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
-
-		time.Sleep(10 * time.Millisecond)
-
-		// 如果当前角色是leader，那么就不需要听心跳
-		rf.roleLock.RLock()
-		role := rf.role
-		rf.roleLock.RUnlock()
-		if role == 2 {
-			continue
-		}
-		// 如果距离上次收到心跳包的时间超过了electionTimeout，那么就需要进行选举
-		rf.lastHeartbeatTimeLock.RLock()
-		lastHeartbeatTime := rf.lastHeartbeatTime
-		rf.lastHeartbeatTimeLock.RUnlock()
-		if lastHeartbeatTime < time.Now().UnixMilli()-int64(rf.electionTimeout) {
-			rf.toCandidate()
-		}
-	}
-}
-
-func (rf *Raft) leaderTick() {
-	for rf.killed() == false {
-		rf.roleLock.RLock()
-		role := rf.role
-		rf.roleLock.RUnlock()
-		rf.currentTermLock.RLock()
-		currentTerm := rf.currentTerm
-		rf.currentTermLock.RUnlock()
-		if role != 2 { // 不再是leader，结束这个go routine
-			// PrintLog("No longer leader", "green", strconv.Itoa(rf.me))
-			return
-		}
-		// 并发发送心跳包
-		for i := 0; i < len(rf.peers); i++ {
-			curI := i
-			go func() {
-				if curI == rf.me { // 跳过自己
-					return
-				}
-				appendEntriesArgs := AppendEntriesArgs{currentTerm, rf.me, 0, 0, nil, 0}
-				appendEntriesReply := AppendEntriesReply{}
-				PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
-				ok := rf.sendAppendEntries(curI, &appendEntriesArgs, &appendEntriesReply)
-				if !ok {
-					PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"] failed", "red", strconv.Itoa(rf.me))
-				}
-				// 处理心跳包的reply
-				rf.appendEntriesRespHandler(&appendEntriesReply)
-			}()
-		}
-
-		time.Sleep(150 * time.Millisecond)
-	}
 }
 
 // the service or tester wants to create a Raft server. the ports

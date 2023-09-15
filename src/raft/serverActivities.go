@@ -111,14 +111,95 @@ func (rf *Raft) toLeader() {
 	rf.currentTermLock.Lock()
 	defer rf.currentTermLock.Unlock()
 
+	rf.nextIndexLock.Lock()
+	defer rf.nextIndexLock.Unlock()
+	rf.matchIndexLock.Lock()
+	defer rf.matchIndexLock.Unlock()
+	rf.logLock.RLock()
+	defer rf.logLock.RUnlock()
+
 	rf.role = 2
 	rf.lastHeartbeatTime = time.Now().UnixMilli()
 	rf.votedFor = -1
 	rf.voteCnt = 0
 	rf.curLeader = rf.me
-	// TODO
+	// 清空nextIndex和matchIndex
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	// 初始化nextIndex和matchIndex
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = -1 // 表示当前leader认为其他server的log为空，(选择初始化为https://thesquareplanet.com/blog/students-guide-to-raft/中的-1而不是论文中的0,貌似因为论文中log index从1开始)
+	}
 
 	// 启动go routine，定期发送心跳包
 	go rf.leaderTick()
 
+}
+
+// The ticker go routine starts a new election if this peer hasn't received
+// heartsbeats recently.
+// follower或candidate
+// 定期检查是否heartbeat超时，如果当前server认为自己是leader，那么就不需要进行选举
+// 否则在electionTimeout时间内没有收到心跳包，就开始选举
+func (rf *Raft) ticker() {
+	for rf.killed() == false {
+
+		// Your code here to check if a leader election should
+		// be started and to randomize sleeping time using
+		// time.Sleep().
+
+		time.Sleep(10 * time.Millisecond)
+
+		// 如果当前角色是leader，那么就不需要听心跳
+		rf.roleLock.RLock()
+		role := rf.role
+		rf.roleLock.RUnlock()
+		if role == 2 {
+			continue
+		}
+		// 如果距离上次收到心跳包的时间超过了electionTimeout，那么就需要进行选举
+		rf.lastHeartbeatTimeLock.RLock()
+		lastHeartbeatTime := rf.lastHeartbeatTime
+		rf.lastHeartbeatTimeLock.RUnlock()
+		if lastHeartbeatTime < time.Now().UnixMilli()-int64(rf.electionTimeout) {
+			rf.toCandidate()
+		}
+	}
+}
+
+func (rf *Raft) leaderTick() {
+	for rf.killed() == false {
+		rf.roleLock.RLock()
+		role := rf.role
+		rf.roleLock.RUnlock()
+		rf.currentTermLock.RLock()
+		currentTerm := rf.currentTerm
+		rf.currentTermLock.RUnlock()
+
+		if role != 2 { // 不再是leader，结束这个go routine
+			// PrintLog("No longer leader", "green", strconv.Itoa(rf.me))
+			return
+		}
+		// 并发发送心跳包
+		for i := 0; i < len(rf.peers); i++ {
+			curI := i
+			go func() {
+				if curI == rf.me { // 跳过自己
+					return
+				}
+				appendEntriesArgs := AppendEntriesArgs{currentTerm, rf.me, 0, 0, nil, 0}
+				appendEntriesReply := AppendEntriesReply{}
+				PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
+				ok := rf.sendAppendEntries(curI, &appendEntriesArgs, &appendEntriesReply)
+				if !ok {
+					PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"] failed", "red", strconv.Itoa(rf.me))
+				}
+				// 处理心跳包的reply
+				rf.appendEntriesRespHandler(&appendEntriesReply)
+			}()
+		}
+
+		time.Sleep(150 * time.Millisecond)
+	}
 }

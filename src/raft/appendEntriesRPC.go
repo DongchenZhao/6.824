@@ -19,7 +19,7 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) AppendEntriesReqHandler(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.currentTermLock.RLock()
 	currentTerm := rf.currentTerm
 	rf.currentTermLock.RUnlock()
@@ -47,6 +47,6 @@ func (rf *Raft) appendEntriesRespHandler(reply *AppendEntriesReply) {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	ok := rf.peers[server].Call("Raft.AppendEntriesReqHandler", args, reply)
 	return ok
 }

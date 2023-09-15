@@ -58,14 +58,62 @@ func (rf *Raft) PrintRaftLog(serverId int) {
 	}
 }
 
-func (rf *Raft) compareLog(prevLogIndex int, prevLogTerm int) bool {
+// TODO 修改
+func (rf *Raft) compareLog(prevLogIndex int, prevLogTerm int) (bool, int, int, int) {
+	XTerm := -1
+	XIndex := -1
+	XLen := 0
 	rf.logLock.RLock()
 	defer rf.logLock.RUnlock()
-	if prevLogIndex >= len(rf.log) {
-		return false // TODO return XTerm, XIndex, XLen
+
+	// 当前server log长度不够，返回rf.log的最后一组term的第一条的index（日志长度为0在getXLogInfo中有处理）
+	if len(rf.log)-1 < prevLogIndex {
+		XTerm, XIndex, XLen = rf.getXLogInfo(-1)
+		return false, XTerm, XIndex, XLen
 	}
+
+	// 匹配成功，但当前server日志可能过长
+	if rf.log[prevLogIndex].Term == prevLogTerm {
+		return true, XTerm, XIndex, XLen
+	}
+
+	// 匹配失败，leader需要将nextIndex移动越过当前server冲突term的所有entry
 	if rf.log[prevLogIndex].Term != prevLogTerm {
-		return false
+		XTerm, XIndex, XLen = rf.getXLogInfo(prevLogIndex)
+		return false, XTerm, XIndex, XLen
 	}
-	return true
+
+	return false, XTerm, XIndex, XLen
+}
+
+// 获取当前server log指定index的最后一组term的第一条log的index和len
+func (rf *Raft) getXLogInfo(index int) (int, int, int) {
+	XTerm := -1
+	XIndex := -1
+	XLen := 0
+
+	rf.logLock.RLock()
+	defer rf.logLock.RUnlock()
+
+	// 日志长度为0
+	if len(rf.log) == 0 {
+		return XTerm, XIndex, XLen
+	}
+
+	// index为-1的时候，返回当前server最后一串term的第一个entry信息
+	i := index
+	if index == -1 {
+		i = len(rf.log) - 1
+	}
+	XTerm = rf.log[i].Term
+	for i != 0 {
+		if rf.log[i].Term != XTerm {
+			XIndex = i + 1
+			XLen = len(rf.log) - XIndex
+			return XTerm, XIndex, XLen
+		}
+		i--
+	}
+	// 日志只有一个term串
+	return XTerm, i, len(rf.log)
 }
