@@ -34,6 +34,17 @@ func (rf *Raft) RequestVoteReqHandler(args *RequestVoteArgs, reply *RequestVoteR
 	rf.voteForLock.RLock()
 	votedFor := rf.votedFor
 	rf.voteForLock.RUnlock()
+	rf.logLock.RLock()
+	var lastLogIndex int
+	var lastLogTerm int
+	if len(rf.log) > 0 {
+		lastLogIndex = len(rf.log) - 1
+		lastLogTerm = rf.log[lastLogIndex].Term
+	} else {
+		lastLogIndex = -1
+		lastLogTerm = currentTerm
+	}
+	rf.logLock.RUnlock()
 
 	// 如果自己term更小，无论自己是哪种身份，转为follower，然后刷新term和voteFor
 	if args.Term > currentTerm {
@@ -44,7 +55,6 @@ func (rf *Raft) RequestVoteReqHandler(args *RequestVoteArgs, reply *RequestVoteR
 
 	// 1.如果自己有更大的term，拒绝投票
 	// 2.如果自己已经投过票，也拒绝投票
-	// 3.如果自己日志更新，也拒绝投票
 	// 隐含了自己是term更大的leader的情况
 	if args.Term < currentTerm || votedFor != -1 {
 		reply.Term = currentTerm
@@ -52,7 +62,16 @@ func (rf *Raft) RequestVoteReqHandler(args *RequestVoteArgs, reply *RequestVoteR
 		return
 	}
 
-	// TODO 自己的log更新，拒绝投票(election restriction)
+	// 3.如果自己日志更新，也拒绝投票
+	// paper 5.4节的election restriction
+	// 如果自己最后一个log的term更高，拒绝投票
+	// 如果自己最后一个log的term和candidate最有一个log的term相同，但自己日志更长，拒绝投票
+	// 这里rf和candidate的term已经相等了
+	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
+		reply.Term = args.Term
+		reply.VoteGranted = false
+		return
+	}
 
 	// 同意投票
 	// 隐含条件是自己term和requestVoteArgs.Term相等（上面currentTerm更小的时候已经和candidate的term同步了）

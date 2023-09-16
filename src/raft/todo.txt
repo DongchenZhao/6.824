@@ -55,4 +55,9 @@ PASS
     - If a follower does not have prevLogIndex in its log, it should return with conflictIndex = len(log) and conflictTerm = None.
     - If a follower does have prevLogIndex in its log, but the term does not match, it should return conflictTerm = log[prevLogIndex].Term, and then search its log for the first index whose entry has term equal to conflictTerm.
     - Upon receiving a conflict response, the leader should first search its log for conflictTerm. If it finds an entry in its log with that term, it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
+    1 1 2 2 3 3 3 4 4 4 4
+    1 1 2 2 3 3 3 3 3 3 3 3 3
     - If it does not find an entry with that term, it should set nextIndex = conflictIndex.
+
+- TODO
+    - XLen 规定不完善

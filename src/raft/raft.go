@@ -99,6 +99,7 @@ type Raft struct {
 	nextIndexLock   sync.RWMutex
 	matchIndexLock  sync.RWMutex
 	commitIndexLock sync.RWMutex
+	lastAppliedLock sync.RWMutex
 }
 
 // return currentTerm and whether this server
@@ -139,9 +140,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		rf.logLock.RLock()
 		defer rf.logLock.RUnlock()
-		index = len(rf.log) + 1
-		// TODO send AE RPC to followers
-
+		index = len(rf.log)
+		rf.log = append(rf.log, LogEntry{term, command})
+		PrintLog("Leader accept a new log", "blue", strconv.Itoa(rf.me))
+		rf.PrintRaftLog()
+		rf.leaderSendAppendEntriesRPC(false)
 	}
 
 	return index, term, isLeader

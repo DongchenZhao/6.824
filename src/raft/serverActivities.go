@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"sort"
 	"strconv"
 	"time"
 )
@@ -37,11 +38,15 @@ func (rf *Raft) toCandidate() {
 	// 获取当前term，me，lastLogIndex，lastLogTerm，这些都是需要发送给其他server的，对这些数据快照，以防不同server收到不同数据
 	me := rf.me
 	rf.logLock.RLock()
-	// TODO lab 2B election restriction
-	//lastLogIndex := len(rf.log) - 1
-	//lastLogTerm := rf.log[lastLogIndex].Term
-	lastLogIndex := 0
-	lastLogTerm := currentTerm
+	var lastLogIndex int
+	var lastLogTerm int
+	if len(rf.log) > 0 {
+		lastLogIndex = len(rf.log) - 1
+		lastLogTerm = rf.log[lastLogIndex].Term
+	} else {
+		lastLogIndex = -1
+		lastLogTerm = currentTerm
+	}
 	rf.logLock.RUnlock()
 
 	// 遍历rf的peer，并发地向每个peer发送RequestVote RPC
@@ -173,52 +178,16 @@ func (rf *Raft) leaderTick() {
 		rf.roleLock.RLock()
 		role := rf.role
 		rf.roleLock.RUnlock()
-		rf.currentTermLock.RLock()
-		currentTerm := rf.currentTerm
-		rf.currentTermLock.RUnlock()
 
 		if role != 2 { // 不再是leader，结束这个go routine
 			// PrintLog("No longer leader", "green", strconv.Itoa(rf.me))
 			return
 		}
 
-		//rf.matchIndexLock.RLock()
-		//matchIndex := make([]int, len(rf.matchIndex))
-		//copy(matchIndex, rf.matchIndex)
-		//rf.matchIndexLock.RUnlock()
-		rf.nextIndexLock.RLock()
-		nextIndex := make([]int, len(rf.nextIndex))
-		copy(nextIndex, rf.nextIndex)
-		rf.nextIndexLock.Unlock()
-		rf.commitIndexLock.RLock()
-		leaderCommit := rf.commitIndex
-		rf.commitIndexLock.RUnlock()
+		rf.leaderSendAppendEntriesRPC(true)
 
-		// 并发发送心跳包
-		for i := 0; i < len(rf.peers); i++ {
-			curI := i
-			go func() {
-				// 跳过自己
-				if curI == rf.me {
-					return
-				}
-				//获取要发送的prevLogIndex和prevLogTerm
-				prevLogIndex := nextIndex[curI] - 1
-				rf.logLock.RLock()
-				prevLogTerm := rf.log[prevLogIndex].Term
-				rf.logLock.RUnlock()
-
-				appendEntriesArgs := AppendEntriesArgs{currentTerm, rf.me, prevLogIndex, prevLogTerm, nil, leaderCommit}
-				appendEntriesReply := AppendEntriesReply{}
-				PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
-				ok := rf.sendAppendEntries(curI, &appendEntriesArgs, &appendEntriesReply)
-				if !ok {
-					PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"] failed", "red", strconv.Itoa(rf.me))
-				}
-				// 处理心跳包的reply
-				rf.appendEntriesRespHandler(&appendEntriesReply)
-			}()
-		}
+		// 检查同步情况，更新commitIndex，发送AE RPC
+		rf.leaderUpdateCommitIndex()
 
 		time.Sleep(150 * time.Millisecond)
 	}
@@ -229,7 +198,7 @@ func (rf *Raft) leaderTick() {
 // 2.rf的log在prevLogIndex位置term冲突，返回(false, rf.log[prevLogIndex].Term, XIndex, XLen) leader需要在自己日志中对rf这个位置上的term进行搜索，根据leader是否有这个rf的这个term串来执行不同的操作
 // 此外，在2的情况下，rf需要截断日志
 // 3.匹配成功，append entries
-func (rf *Raft) compareAndHandleLog(prevLogIndex int, prevLogTerm int, entries []LogEntry, leaderCommit int) (bool, int, int, int) {
+func (rf *Raft) compareAndHandleLog(prevLogIndex int, prevLogTerm int, entries []LogEntry) (bool, int, int, int) {
 	XTerm := -1
 	XIndex := -1
 	XLen := 0
@@ -242,41 +211,39 @@ func (rf *Raft) compareAndHandleLog(prevLogIndex int, prevLogTerm int, entries [
 	}
 	rf.logLock.RUnlock()
 
-	// 当前server log长度不够，XTerm = -1, XIndex=Len(rf.log) leader下次会尝试匹配rf的最后一条日志
+	// 1. 当前server log长度不够，XTerm = -1, XIndex=Len(rf.log) leader下次会尝试匹配rf的最后一条日志
 	if len(log)-1 < prevLogIndex {
 		XTerm, XIndex, XLen = -1, len(log), len(log)
-		PrintLog("log compare failed, current server's log is too short", "blue", strconv.Itoa(rf.me))
+		PrintLog("log compare failed, empty entry at prevLogIndex", "blue", strconv.Itoa(rf.me))
 		rf.PrintRaftLog()
 		return false, XTerm, XIndex, XLen
 	}
 
-	// 匹配失败，leader需要将nextIndex移动越过当前server冲突term的所有entry
+	// 2. 匹配失败，leader需要将nextIndex移动越过当前server冲突term的所有entry
 	// If a follower does have prevLogIndex in its log, but the term does not match,
 	// it should return conflictTerm = log[prevLogIndex].Term,
 	// and then search its log for the first index whose entry has term equal to conflictTerm.
-	// 此外，在这种日志部匹配的情况下，rf需要截断日志
+	// 此外，在这种日志不匹配的情况下，rf需要截断日志
 	if log[prevLogIndex].Term != prevLogTerm {
 		XTerm, XIndex, XLen = rf.getXLogInfo(prevLogIndex)
-		PrintLog("log compare failed, not match at prevLogIndex", "blue", strconv.Itoa(rf.me))
+		PrintLog("log compare failed, mismatch at prevLogIndex", "blue", strconv.Itoa(rf.me))
 		rf.PrintRaftLog()
 		// 截断日志
 		rf.logLock.Lock()
-		defer rf.logLock.RUnlock()
+		defer rf.logLock.Unlock()
 		rf.log = rf.log[:prevLogIndex]
 		return false, XTerm, XIndex, XLen
 	}
 
-	// 匹配成功，但rf日志可能过长
-	// 过长部分会直接被entries覆盖
+	// 3. 匹配成功
+	// append entries
+	// rf日志可能过长,但是过长部分会直接被entries覆盖
 	if log[prevLogIndex].Term == prevLogTerm {
 		rf.logLock.Lock()
 		defer rf.logLock.Unlock()
-		rf.log = append(log[:prevLogIndex+1], entries...)
-		// set leaderCommit
-		rf.commitIndexLock.Lock()
-		defer rf.commitIndexLock.Unlock()
-		if leaderCommit > rf.commitIndex {
-			// rf.commitIndex = int(math.Min(leaderCommit, len(rf.log)-1))
+		// 如果是心跳包,或者空entries(表示已经和leader同步了),不修改本地日志（也不截断）
+		if len(entries) > 0 { // 空切片len为0
+			rf.log = append(log[:prevLogIndex+1], entries...)
 		}
 		return true, XTerm, XIndex, XLen
 	}
@@ -315,4 +282,123 @@ func (rf *Raft) getXLogInfo(index int) (int, int, int) {
 	}
 	// 日志只有一个term串
 	return XTerm, i, len(rf.log)
+}
+
+// matchIndex变动，leader判断是否要更新commitIndex
+func (rf *Raft) leaderUpdateCommitIndex() {
+	rf.matchIndexLock.RLock()
+	matchIndex := make([]int, len(rf.matchIndex))
+	copy(matchIndex, rf.matchIndex)
+	rf.matchIndexLock.RUnlock()
+
+	rf.logLock.RLock()
+	log := make([]LogEntry, len(rf.log))
+	for i := 0; i < len(rf.log); i++ {
+		log[i].Term = rf.log[i].Term
+	}
+	rf.logLock.RUnlock()
+
+	rf.commitIndexLock.RLock()
+	commitIndex := rf.commitIndex
+	rf.commitIndexLock.RUnlock()
+
+	rf.currentTermLock.RLock()
+	currentTerm := rf.currentTerm
+	rf.currentTermLock.RUnlock()
+
+	// 滑动窗口查找matchIndex中大多数
+	majorityIndex := -1
+	sort.Ints(matchIndex)
+	i, windowLen := 0, 0
+	for {
+		if i+windowLen > len(matchIndex)-1 {
+			break
+		}
+		if windowLen+1 > (len(rf.peers)+1)/2 {
+			majorityIndex = matchIndex[i]
+		}
+		if matchIndex[i] != matchIndex[i+windowLen] {
+			i = i + windowLen
+			windowLen = 0
+		}
+		windowLen += 1
+	}
+
+	// leader 仅当majorityIndex更新，且为当前term的时候才会提交
+	cond1 := majorityIndex > commitIndex
+	cond2 := log[majorityIndex].Term == currentTerm
+	if cond1 && cond2 {
+		rf.commitIndexLock.Lock()
+		rf.lastAppliedLock.Lock()
+		rf.commitIndex = majorityIndex
+		rf.lastApplied = rf.commitIndex
+		rf.lastAppliedLock.Unlock()
+		rf.commitIndexLock.Unlock()
+	}
+
+	rf.leaderSendAppendEntriesRPC(false)
+}
+
+func (rf *Raft) leaderSendAppendEntriesRPC(isHeartBeat bool) {
+
+	rf.nextIndexLock.RLock()
+	rf.logLock.RLock()
+	rf.currentTermLock.RLock()
+	rf.commitIndexLock.RLock()
+
+	currentTerm := rf.currentTerm
+	leaderCommit := rf.commitIndex
+
+	nextIndex := make([]int, len(rf.nextIndex))
+	copy(nextIndex, rf.nextIndex)
+
+	log := make([]LogEntry, len(rf.log))
+	for i := 0; i < len(rf.log); i++ {
+		log[i].Term = rf.log[i].Term
+	}
+
+	rf.commitIndexLock.RUnlock()
+	rf.nextIndexLock.RUnlock()
+	rf.logLock.RUnlock()
+	rf.currentTermLock.RUnlock()
+
+	// leader发送含有entries的AE RPC
+	for i := 0; i < len(rf.peers); i++ {
+		curI := i
+		go func() {
+			if curI == rf.me { // 跳过自己
+				return
+			}
+			//获取要发送的prevLogIndex和prevLogTerm
+			prevLogIndex := nextIndex[curI] - 1
+			prevLogTerm := log[prevLogIndex].Term
+
+			// 获取要发送的entries
+			var entries []LogEntry
+			if isHeartBeat {
+				rf.logLock.RLock()
+				entries = make([]LogEntry, len(rf.log)-prevLogIndex-1)
+				for j := prevLogIndex + 1; j < len(rf.log); j++ {
+					entries[j-prevLogIndex-1] = rf.log[j]
+				}
+				rf.logLock.RUnlock()
+			} else {
+				entries = nil
+			}
+
+			appendEntriesArgs := AppendEntriesArgs{currentTerm, rf.me, prevLogIndex, prevLogTerm, entries, leaderCommit}
+			appendEntriesReply := AppendEntriesReply{}
+			if isHeartBeat {
+				PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
+			} else {
+				PrintLog("appendEntries send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
+			}
+			ok := rf.sendAppendEntries(curI, &appendEntriesArgs, &appendEntriesReply)
+			if !ok {
+				PrintLog("appendEntries send to [Server "+strconv.Itoa(curI)+"] failed", "yellow", strconv.Itoa(rf.me))
+			}
+			// 处理心跳包的reply
+			rf.appendEntriesRespHandler(&appendEntriesArgs, &appendEntriesReply)
+		}()
+	}
 }
