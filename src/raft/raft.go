@@ -85,6 +85,7 @@ type Raft struct {
 	electionTimeout   int
 	voteCnt           int
 	curLeader         int
+	applyCh           chan ApplyMsg
 
 	// ------ locks ------
 	// ------2A ------
@@ -138,13 +139,24 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	term, isLeader := rf.GetState()
 	if isLeader {
-		rf.logLock.RLock()
-		defer rf.logLock.RUnlock()
-		index = len(rf.log)
+		// 更新日志
+		rf.logLock.Lock()
 		rf.log = append(rf.log, LogEntry{term, command})
+		index = len(rf.log) - 1
+		rf.logLock.Unlock()
+
+		// 更新nextIndex和matchIndex自己的位置
+		rf.matchIndexLock.Lock()
+		rf.matchIndex[rf.me] = index
+		rf.matchIndexLock.Unlock()
+
+		rf.nextIndexLock.Lock()
+		rf.nextIndex[rf.me] = index + 1
+		rf.nextIndexLock.Unlock()
+
 		PrintLog("Leader accept a new log", "blue", strconv.Itoa(rf.me))
 		rf.PrintRaftLog()
-		rf.leaderSendAppendEntriesRPC(false)
+		// rf.leaderSendAppendEntriesRPC(false)
 	}
 
 	return index, term, isLeader
@@ -184,20 +196,38 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	PrintLog("Starting server", "default", strconv.Itoa(rf.me))
 
-	//初始化一些field，这里不考虑并发问题
+	//初始化一些field
+	rf.currentTermLock.Lock()
 	rf.currentTerm = 0
+	rf.currentTermLock.Unlock()
+
+	rf.voteForLock.Lock()
 	rf.votedFor = -1
+	rf.voteForLock.Unlock()
+
+	rf.logLock.Lock()
 	rf.log = make([]LogEntry, 0)
+	rf.logLock.Unlock()
+
+	// 初始状态commitIndex和lastApplied都是-1
+	rf.commitIndexLock.Lock()
+	rf.commitIndex = -1
+	rf.commitIndexLock.Unlock()
+
+	rf.lastAppliedLock.Lock()
+	rf.lastApplied = -1
+	rf.lastAppliedLock.Unlock()
+
+	// 初始化electionTimeout，设置为550-800ms之间的随机数
+	rf.electionTimeout = 550 + rand.Intn(300)
 
 	// 重置一下状态(其实只重置了时钟)
 	rf.toFollower(0)
-
-	// 初始化electionTimeout，设置为500-800ms之间的随机数
-	rf.electionTimeout = 500 + rand.Intn(300)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

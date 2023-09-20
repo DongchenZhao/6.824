@@ -29,6 +29,7 @@ func selectColor(inputColor string) string {
 }
 
 func PrintLog(content string, options ...string) {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	color := "" // default color
 	serverId := "-1"
 	if len(options) > 0 {
@@ -43,17 +44,22 @@ func PrintLog(content string, options ...string) {
 
 func (rf *Raft) PrintRaftLog() {
 	rf.logLock.RLock()
-	rfLog := rf.log
-	rf.logLock.RUnlock()
-	colorList := []string{"red", "green", "yellow", "blue", "purple", "skyblue"}
-	// 遍历log每一条，相同term用同种颜色打印
-	for i := 0; i < len(rfLog); i++ {
-		curTerm := rfLog[i].Term
-		curTermStr := strconv.Itoa(curTerm)
-		curColor := selectColor(colorList[curTerm%len(colorList)])
-		if i == 0 {
-			log.Print("[Server " + strconv.Itoa(rf.me) + "] logs: ")
-		}
-		log.Print(curColor + curTermStr + "\033[0m" + "  ")
+	rfLog := make([]LogEntry, len(rf.log))
+	for i := 0; i < len(rf.log); i++ {
+		rfLog[i].Term = rf.log[i].Term
 	}
+	rf.logLock.RUnlock()
+
+	if len(rfLog) == 0 {
+		PrintLog("[LOG] log empty", "purple", strconv.Itoa(rf.me))
+		return
+	}
+
+	logStr := "[SERVER LOG]: "
+
+	for i := 0; i < len(rfLog); i++ {
+		logStr += strconv.Itoa(rfLog[i].Term) + " "
+	}
+	PrintLog(logStr, "red", strconv.Itoa(rf.me))
+
 }

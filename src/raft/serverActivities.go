@@ -62,7 +62,7 @@ func (rf *Raft) toCandidate() {
 			requestVoteReply := RequestVoteReply{}
 			ok := rf.sendRequestVote(curI, &requestVoteArgs, &requestVoteReply)
 			if !ok {
-				PrintLog("RequestVote send to [Server "+strconv.Itoa(curI)+"] failed", "red", strconv.Itoa(rf.me))
+				PrintLog("RequestVote send to [Server "+strconv.Itoa(curI)+"] failed", "yellow", strconv.Itoa(rf.me))
 			}
 			rf.requestVoteRespHandler(&requestVoteReply)
 		}()
@@ -103,7 +103,9 @@ func (rf *Raft) toFollower(term int) {
 
 func (rf *Raft) toLeader() {
 
-	PrintLog("-> leader", "green", strconv.Itoa(rf.me))
+	rf.currentTermLock.RLock()
+	PrintLog("-> leader for term ["+strconv.Itoa(rf.currentTerm)+"]", "green", strconv.Itoa(rf.me))
+	rf.currentTermLock.RUnlock()
 	// 重置一些状态
 	rf.roleLock.Lock()
 	defer rf.roleLock.Unlock()
@@ -113,8 +115,6 @@ func (rf *Raft) toLeader() {
 	defer rf.voteForLock.Unlock()
 	rf.voteCntLock.Lock()
 	defer rf.voteCntLock.Unlock()
-	rf.currentTermLock.Lock()
-	defer rf.currentTermLock.Unlock()
 
 	rf.nextIndexLock.Lock()
 	defer rf.nextIndexLock.Unlock()
@@ -122,7 +122,6 @@ func (rf *Raft) toLeader() {
 	defer rf.matchIndexLock.Unlock()
 	rf.logLock.RLock()
 	defer rf.logLock.RUnlock()
-
 	rf.role = 2
 	rf.lastHeartbeatTime = time.Now().UnixMilli()
 	rf.votedFor = -1
@@ -180,10 +179,11 @@ func (rf *Raft) leaderTick() {
 		rf.roleLock.RUnlock()
 
 		if role != 2 { // 不再是leader，结束这个go routine
-			// PrintLog("No longer leader", "green", strconv.Itoa(rf.me))
+			PrintLog("No longer leader", "green", strconv.Itoa(rf.me))
 			return
 		}
 
+		// 发送心跳包
 		rf.leaderSendAppendEntriesRPC(true)
 
 		// 检查同步情况，更新commitIndex，发送AE RPC
@@ -198,7 +198,7 @@ func (rf *Raft) leaderTick() {
 // 2.rf的log在prevLogIndex位置term冲突，返回(false, rf.log[prevLogIndex].Term, XIndex, XLen) leader需要在自己日志中对rf这个位置上的term进行搜索，根据leader是否有这个rf的这个term串来执行不同的操作
 // 此外，在2的情况下，rf需要截断日志
 // 3.匹配成功，append entries
-func (rf *Raft) compareAndHandleLog(prevLogIndex int, prevLogTerm int, entries []LogEntry) (bool, int, int, int) {
+func (rf *Raft) compareAndHandleLog(prevLogTerm int, prevLogIndex int, entries []LogEntry) (bool, int, int, int) {
 	XTerm := -1
 	XIndex := -1
 	XLen := 0
@@ -219,7 +219,24 @@ func (rf *Raft) compareAndHandleLog(prevLogIndex int, prevLogTerm int, entries [
 		return false, XTerm, XIndex, XLen
 	}
 
-	// 2. 匹配失败，leader需要将nextIndex移动越过当前server冲突term的所有entry
+	// 2. 匹配成功
+	// append entries
+	// rf日志可能过长,但是过长部分会直接被entries覆盖
+	// fixed:待匹配的index为-1，相当于默认匹配成功，这涵盖了当前rf日志长度为0和不为0的情况
+	// fixed:匹配成功放在最前面，因为处理了prevLogIndex为-1的情况
+	if prevLogIndex == -1 || log[prevLogIndex].Term == prevLogTerm {
+		// 如果是心跳包,或者空entries(表示已经和leader同步了),不修改本地日志（也不截断）
+		if len(entries) > 0 { // 空切片len为0
+			rf.logLock.Lock()
+			rf.log = append(log[:prevLogIndex+1], entries...)
+			rf.logLock.Unlock()
+			PrintLog("log compare success, append entries", "blue", strconv.Itoa(rf.me))
+			rf.PrintRaftLog()
+		}
+		return true, XTerm, XIndex, XLen
+	}
+
+	// 3. 匹配失败，leader需要将nextIndex移动越过当前server冲突term的所有entry
 	// If a follower does have prevLogIndex in its log, but the term does not match,
 	// it should return conflictTerm = log[prevLogIndex].Term,
 	// and then search its log for the first index whose entry has term equal to conflictTerm.
@@ -230,22 +247,9 @@ func (rf *Raft) compareAndHandleLog(prevLogIndex int, prevLogTerm int, entries [
 		rf.PrintRaftLog()
 		// 截断日志
 		rf.logLock.Lock()
-		defer rf.logLock.Unlock()
 		rf.log = rf.log[:prevLogIndex]
+		rf.logLock.Unlock()
 		return false, XTerm, XIndex, XLen
-	}
-
-	// 3. 匹配成功
-	// append entries
-	// rf日志可能过长,但是过长部分会直接被entries覆盖
-	if log[prevLogIndex].Term == prevLogTerm {
-		rf.logLock.Lock()
-		defer rf.logLock.Unlock()
-		// 如果是心跳包,或者空entries(表示已经和leader同步了),不修改本地日志（也不截断）
-		if len(entries) > 0 { // 空切片len为0
-			rf.log = append(log[:prevLogIndex+1], entries...)
-		}
-		return true, XTerm, XIndex, XLen
 	}
 
 	PrintLog("log compare error, unknown error", "red", strconv.Itoa(rf.me))
@@ -284,8 +288,10 @@ func (rf *Raft) getXLogInfo(index int) (int, int, int) {
 	return XTerm, i, len(rf.log)
 }
 
-// matchIndex变动，leader判断是否要更新commitIndex
+// 定期检查日志同步情况，给需要同步的server发送AE RPC
 func (rf *Raft) leaderUpdateCommitIndex() {
+	PrintLog("Start leaderUpdateCommitIndex", "purple", strconv.Itoa(rf.me))
+
 	rf.matchIndexLock.RLock()
 	matchIndex := make([]int, len(rf.matchIndex))
 	copy(matchIndex, rf.matchIndex)
@@ -297,6 +303,11 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 		log[i].Term = rf.log[i].Term
 	}
 	rf.logLock.RUnlock()
+
+	// fixed: leader log为空时，不需要更新commitIndex
+	if len(log) == 0 {
+		return
+	}
 
 	rf.commitIndexLock.RLock()
 	commitIndex := rf.commitIndex
@@ -314,7 +325,7 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 		if i+windowLen > len(matchIndex)-1 {
 			break
 		}
-		if windowLen+1 > (len(rf.peers)+1)/2 {
+		if windowLen+1 >= (len(rf.peers)+1)/2 {
 			majorityIndex = matchIndex[i]
 		}
 		if matchIndex[i] != matchIndex[i+windowLen] {
@@ -324,81 +335,44 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 		windowLen += 1
 	}
 
+	matchIndexStr := "["
+	for i := 0; i < len(matchIndex); i++ {
+		matchIndexStr += strconv.Itoa(matchIndex[i]) + " "
+	}
+	matchIndexStr += "]"
+	PrintLog("matchIndex: "+matchIndexStr, "purple", strconv.Itoa(rf.me))
+
 	// leader 仅当majorityIndex更新，且为当前term的时候才会提交
+	PrintLog("majorityIndex: "+strconv.Itoa(majorityIndex)+" commitIndex: "+strconv.Itoa(commitIndex)+" currentTerm: "+strconv.Itoa(currentTerm), "purple", strconv.Itoa(rf.me))
+	if majorityIndex == -1 { // 如果大多数server的日志都为空，那么就不需要更新commitIndex
+		return
+	}
 	cond1 := majorityIndex > commitIndex
 	cond2 := log[majorityIndex].Term == currentTerm
 	if cond1 && cond2 {
 		rf.commitIndexLock.Lock()
 		rf.lastAppliedLock.Lock()
+		prevCommitIndex := rf.commitIndex
 		rf.commitIndex = majorityIndex
 		rf.lastApplied = rf.commitIndex
 		rf.lastAppliedLock.Unlock()
 		rf.commitIndexLock.Unlock()
+		rf.sendNewlyCommittedLog(prevCommitIndex)
 	}
 
 	rf.leaderSendAppendEntriesRPC(false)
 }
 
-func (rf *Raft) leaderSendAppendEntriesRPC(isHeartBeat bool) {
+func (rf *Raft) sendNewlyCommittedLog(prevCommitIndex int) {
+	PrintLog("sendNewlyCommittedLog", "purple", strconv.Itoa(rf.me))
 
-	rf.nextIndexLock.RLock()
-	rf.logLock.RLock()
-	rf.currentTermLock.RLock()
 	rf.commitIndexLock.RLock()
-
-	currentTerm := rf.currentTerm
-	leaderCommit := rf.commitIndex
-
-	nextIndex := make([]int, len(rf.nextIndex))
-	copy(nextIndex, rf.nextIndex)
-
-	log := make([]LogEntry, len(rf.log))
-	for i := 0; i < len(rf.log); i++ {
-		log[i].Term = rf.log[i].Term
-	}
-
+	commitIndex := rf.commitIndex
 	rf.commitIndexLock.RUnlock()
-	rf.nextIndexLock.RUnlock()
-	rf.logLock.RUnlock()
-	rf.currentTermLock.RUnlock()
 
-	// leader发送含有entries的AE RPC
-	for i := 0; i < len(rf.peers); i++ {
-		curI := i
-		go func() {
-			if curI == rf.me { // 跳过自己
-				return
-			}
-			//获取要发送的prevLogIndex和prevLogTerm
-			prevLogIndex := nextIndex[curI] - 1
-			prevLogTerm := log[prevLogIndex].Term
-
-			// 获取要发送的entries
-			var entries []LogEntry
-			if isHeartBeat {
-				rf.logLock.RLock()
-				entries = make([]LogEntry, len(rf.log)-prevLogIndex-1)
-				for j := prevLogIndex + 1; j < len(rf.log); j++ {
-					entries[j-prevLogIndex-1] = rf.log[j]
-				}
-				rf.logLock.RUnlock()
-			} else {
-				entries = nil
-			}
-
-			appendEntriesArgs := AppendEntriesArgs{currentTerm, rf.me, prevLogIndex, prevLogTerm, entries, leaderCommit}
-			appendEntriesReply := AppendEntriesReply{}
-			if isHeartBeat {
-				PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
-			} else {
-				PrintLog("appendEntries send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
-			}
-			ok := rf.sendAppendEntries(curI, &appendEntriesArgs, &appendEntriesReply)
-			if !ok {
-				PrintLog("appendEntries send to [Server "+strconv.Itoa(curI)+"] failed", "yellow", strconv.Itoa(rf.me))
-			}
-			// 处理心跳包的reply
-			rf.appendEntriesRespHandler(&appendEntriesArgs, &appendEntriesReply)
-		}()
+	rf.logLock.RLock()
+	for i := prevCommitIndex + 1; i <= commitIndex; i++ {
+		// 发送到kv server
+		rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
 	}
 }

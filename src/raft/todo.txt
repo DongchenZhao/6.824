@@ -61,3 +61,5 @@ PASS
 
 - TODO
     - XLen 规定不完善
+    - leader定期检查日志匹配情况，有选择地发送AE RPC
+    - leader收到log忘记更新自己的matchIndex了  done

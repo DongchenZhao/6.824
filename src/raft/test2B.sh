@@ -1,1 +1,1 @@
-go test -race -run 2B
+time go test -race -run 2B

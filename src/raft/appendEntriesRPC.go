@@ -67,10 +67,14 @@ func (rf *Raft) AppendEntriesReqHandler(args *AppendEntriesArgs, reply *AppendEn
 			}
 			rf.commitIndexLock.Lock()
 			rf.lastAppliedLock.Lock()
-			defer rf.lastAppliedLock.Unlock()
-			defer rf.commitIndexLock.Unlock()
+
 			rf.commitIndex = min
 			rf.lastApplied = rf.commitIndex
+
+			rf.lastAppliedLock.Unlock()
+			rf.commitIndexLock.Unlock()
+
+			rf.sendNewlyCommittedLog(commitIndex)
 		}
 	}
 }
@@ -98,10 +102,16 @@ func (rf *Raft) appendEntriesRespHandler(args *AppendEntriesArgs, reply *AppendE
 	}
 	rf.logLock.Unlock()
 
-	// 对陈旧AE RPC的响应进行处理，当前leader已经更新了nextIndex，但是仍然收到陈旧的冲突response，陈旧的resp中包含冲突的日志index小于leader知道的对方已匹配日志
-	knownEntryIndex := matchIndex[reply.ServerId]
-	if reply.XIndex < knownEntryIndex {
-		PrintLog(fmt.Sprintf("Expired AE RPC response from [Server %d]", reply.ServerId), "yellow", strconv.Itoa(rf.me))
+	// 对陈旧AE RPC的响应进行处理，
+	// 当前leader已经更新了nextIndex，但是仍然收到陈旧的冲突response，
+	// 陈旧的resp中包含冲突的日志index小于leader知道的对方已匹配日志
+	knownMatchIndex := matchIndex[reply.ServerId]
+	if (!reply.Success) && reply.XIndex < knownMatchIndex {
+		PrintLog(fmt.Sprintf("Expired FAILURE AE RPC response from [Server %d]", reply.ServerId), "yellow", strconv.Itoa(rf.me))
+		return
+	} else if (args.PrevLogIndex + len(args.Entries)) < knownMatchIndex {
+		PrintLog(fmt.Sprintf("Expired SUCCESS AE RPC response from [Server %d]", reply.ServerId), "yellow", strconv.Itoa(rf.me))
+		return
 	}
 
 	// 1. 对方日志太短
@@ -144,13 +154,24 @@ func (rf *Raft) appendEntriesRespHandler(args *AppendEntriesArgs, reply *AppendE
 	// 这里已经排除了陈旧RPC
 	if reply.Success {
 		rf.nextIndexLock.Lock()
-		defer rf.nextIndexLock.Unlock()
 		nextIndex := args.PrevLogIndex + len(args.Entries) + 1
 		rf.nextIndex[reply.ServerId] = nextIndex
+		rf.nextIndexLock.Unlock()
 
 		rf.matchIndexLock.Lock()
-		defer rf.matchIndexLock.Unlock()
 		rf.matchIndex[reply.ServerId] = nextIndex - 1
+		rf.matchIndexLock.Unlock()
+
+		// 将nextIndex转为字符串
+		rf.nextIndexLock.RLock()
+		nextIndexStr := "["
+		for i := 0; i < len(rf.nextIndex); i++ {
+			nextIndexStr += strconv.Itoa(rf.nextIndex[i]) + " "
+		}
+		nextIndexStr += "]"
+		PrintLog("AE RPC SUCCESS, nextIndex: "+nextIndexStr, "purple", strconv.Itoa(rf.me))
+		rf.nextIndexLock.RUnlock()
+		// 集群日志同步状态检查会定期触发，这里不需要再触发
 	}
 
 }
@@ -158,4 +179,83 @@ func (rf *Raft) appendEntriesRespHandler(args *AppendEntriesArgs, reply *AppendE
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntriesReqHandler", args, reply)
 	return ok
+}
+
+func (rf *Raft) leaderSendAppendEntriesRPC(isHeartBeat bool) {
+
+	rf.nextIndexLock.RLock()
+	rf.logLock.RLock()
+	rf.currentTermLock.RLock()
+	rf.commitIndexLock.RLock()
+
+	currentTerm := rf.currentTerm
+	leaderCommit := rf.commitIndex
+
+	nextIndex := make([]int, len(rf.nextIndex))
+	copy(nextIndex, rf.nextIndex)
+
+	log := make([]LogEntry, len(rf.log))
+	for i := 0; i < len(rf.log); i++ {
+		log[i].Term = rf.log[i].Term
+	}
+
+	rf.commitIndexLock.RUnlock()
+	rf.nextIndexLock.RUnlock()
+	rf.logLock.RUnlock()
+	rf.currentTermLock.RUnlock()
+
+	// leader发送含有entries的AE RPC
+	for i := 0; i < len(rf.peers); i++ {
+		curI := i
+		go func() {
+			if curI == rf.me { // 跳过自己
+				return
+			}
+			//获取要发送的prevLogIndex和prevLogTerm
+			prevLogIndex := nextIndex[curI] - 1
+			prevLogTerm := currentTerm
+			if prevLogIndex >= 0 { // 考虑一开始leader日志为空的情况
+				prevLogTerm = log[prevLogIndex].Term
+			}
+
+			// 获取要发送的entries
+			var entries []LogEntry
+			if isHeartBeat {
+				entries = nil
+			} else {
+				if prevLogIndex == len(rf.log)-1 {
+					return
+				}
+				rf.logLock.RLock()
+				entries = make([]LogEntry, len(rf.log)-prevLogIndex-1)
+				for j := prevLogIndex + 1; j < len(rf.log); j++ {
+					entries[j-prevLogIndex-1] = rf.log[j]
+				}
+				rf.logLock.RUnlock()
+			}
+
+			appendEntriesArgs := AppendEntriesArgs{currentTerm, rf.me, prevLogIndex, prevLogTerm, entries, leaderCommit}
+			appendEntriesReply := AppendEntriesReply{}
+
+			// 打印消息日志
+			if isHeartBeat {
+				PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
+			} else {
+				// 将entries内容拼成字符串，打印prevLogIndex, prevLogTerm和entriesStr
+				entriesStr := "["
+				for i := 0; i < len(entries); i++ {
+					entriesStr += strconv.Itoa(entries[i].Term) + " "
+				}
+				entriesStr += "]"
+				PrintLog("Sending appendEntries to [Server "+strconv.Itoa(curI)+"]"+"prevLogIndex: "+strconv.Itoa(prevLogIndex)+" prevLogTerm: "+strconv.Itoa(prevLogTerm)+" entries: "+entriesStr, "purple", strconv.Itoa(rf.me))
+			}
+
+			ok := rf.sendAppendEntries(curI, &appendEntriesArgs, &appendEntriesReply)
+			if !ok {
+				PrintLog("appendEntries send to [Server "+strconv.Itoa(curI)+"] failed", "yellow", strconv.Itoa(rf.me))
+			}
+			// 处理心跳包的reply
+			rf.appendEntriesRespHandler(&appendEntriesArgs, &appendEntriesReply)
+		}()
+	}
 }
