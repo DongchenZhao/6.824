@@ -86,7 +86,7 @@ func (rf *Raft) toFollower(term int) {
 	rf.role = 0
 	rf.lastHeartbeatTime = time.Now().UnixMilli()
 	if currentTerm < term { // 对方term更新，更新自己的term，重置voteFor，voteCnt
-		PrintLog("-> follower, update term to ["+strconv.Itoa(term)+"], previous term ["+strconv.Itoa(currentTerm)+"]", "green", strconv.Itoa(rf.me))
+		PrintLog("-> follower, time expired, update term to ["+strconv.Itoa(term)+"], previous term ["+strconv.Itoa(currentTerm)+"]", "green", strconv.Itoa(rf.me))
 
 		rf.currentTermLock.Lock()
 		defer rf.currentTermLock.Unlock()
@@ -108,20 +108,13 @@ func (rf *Raft) toLeader() {
 	rf.currentTermLock.RUnlock()
 	// 重置一些状态
 	rf.roleLock.Lock()
-	defer rf.roleLock.Unlock()
 	rf.lastHeartbeatTimeLock.Lock()
-	defer rf.lastHeartbeatTimeLock.Unlock()
 	rf.voteForLock.Lock()
-	defer rf.voteForLock.Unlock()
 	rf.voteCntLock.Lock()
-	defer rf.voteCntLock.Unlock()
-
 	rf.nextIndexLock.Lock()
-	defer rf.nextIndexLock.Unlock()
 	rf.matchIndexLock.Lock()
-	defer rf.matchIndexLock.Unlock()
 	rf.logLock.RLock()
-	defer rf.logLock.RUnlock()
+
 	rf.role = 2
 	rf.lastHeartbeatTime = time.Now().UnixMilli()
 	rf.votedFor = -1
@@ -130,11 +123,19 @@ func (rf *Raft) toLeader() {
 	// 清空nextIndex和matchIndex
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-	// 初始化nextIndex和matchIndex
+	// 初始化nextIndex[]和matchIndex[]
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = len(rf.log)
 		rf.matchIndex[i] = -1 // 表示当前leader认为其他server的log为空，(选择初始化为https://thesquareplanet.com/blog/students-guide-to-raft/中的-1而不是论文中的0,貌似因为论文中log index从1开始)
 	}
+
+	rf.roleLock.Unlock()
+	rf.lastHeartbeatTimeLock.Unlock()
+	rf.voteForLock.Unlock()
+	rf.voteCntLock.Unlock()
+	rf.nextIndexLock.Unlock()
+	rf.matchIndexLock.Unlock()
+	rf.logLock.RUnlock()
 
 	// 启动go routine，定期发送心跳包
 	go rf.leaderTick()
@@ -267,6 +268,7 @@ func (rf *Raft) getXLogInfo(index int) (int, int, int) {
 
 	// 日志长度为0
 	if len(rf.log) == 0 {
+		PrintLog("getXLogInfo error, log is empty", "red", strconv.Itoa(rf.me))
 		return XTerm, XIndex, XLen
 	}
 
@@ -290,11 +292,13 @@ func (rf *Raft) getXLogInfo(index int) (int, int, int) {
 
 // 定期检查日志同步情况，给需要同步的server发送AE RPC
 func (rf *Raft) leaderUpdateCommitIndex() {
-	PrintLog("Start leaderUpdateCommitIndex", "purple", strconv.Itoa(rf.me))
 
 	rf.matchIndexLock.RLock()
 	matchIndex := make([]int, len(rf.matchIndex))
+	sortedMatchIndex := make([]int, len(rf.matchIndex))
 	copy(matchIndex, rf.matchIndex)
+	copy(sortedMatchIndex, rf.matchIndex)
+	sort.Ints(sortedMatchIndex)
 	rf.matchIndexLock.RUnlock()
 
 	rf.logLock.RLock()
@@ -319,16 +323,15 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 
 	// 滑动窗口查找matchIndex中大多数
 	majorityIndex := -1
-	sort.Ints(matchIndex)
 	i, windowLen := 0, 0
 	for {
-		if i+windowLen > len(matchIndex)-1 {
+		if i+windowLen > len(sortedMatchIndex)-1 {
 			break
 		}
 		if windowLen+1 >= (len(rf.peers)+1)/2 {
-			majorityIndex = matchIndex[i]
+			majorityIndex = sortedMatchIndex[i]
 		}
-		if matchIndex[i] != matchIndex[i+windowLen] {
+		if sortedMatchIndex[i] != sortedMatchIndex[i+windowLen] {
 			i = i + windowLen
 			windowLen = 0
 		}
@@ -340,31 +343,35 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 		matchIndexStr += strconv.Itoa(matchIndex[i]) + " "
 	}
 	matchIndexStr += "]"
-	PrintLog("matchIndex: "+matchIndexStr, "purple", strconv.Itoa(rf.me))
+	// PrintLog("matchIndex: "+matchIndexStr, "purple", strconv.Itoa(rf.me))
 
 	// leader 仅当majorityIndex更新，且为当前term的时候才会提交
-	PrintLog("majorityIndex: "+strconv.Itoa(majorityIndex)+" commitIndex: "+strconv.Itoa(commitIndex)+" currentTerm: "+strconv.Itoa(currentTerm), "purple", strconv.Itoa(rf.me))
-	if majorityIndex == -1 { // 如果大多数server的日志都为空，那么就不需要更新commitIndex
-		return
-	}
-	cond1 := majorityIndex > commitIndex
-	cond2 := log[majorityIndex].Term == currentTerm
-	if cond1 && cond2 {
-		rf.commitIndexLock.Lock()
-		rf.lastAppliedLock.Lock()
-		prevCommitIndex := rf.commitIndex
-		rf.commitIndex = majorityIndex
-		rf.lastApplied = rf.commitIndex
-		rf.lastAppliedLock.Unlock()
-		rf.commitIndexLock.Unlock()
-		rf.sendNewlyCommittedLog(prevCommitIndex)
+
+	// PrintLog("majorityIndex: "+strconv.Itoa(majorityIndex)+" commitIndex: "+strconv.Itoa(commitIndex)+" currentTerm: "+strconv.Itoa(currentTerm), "purple", strconv.Itoa(rf.me))
+
+	// leader 发送AE RPC
+	// TODO 单独goroutine
+	// rf.leaderSendAppendEntriesRPC(false)
+
+	if majorityIndex != -1 { // 如果大多数server的日志都为空，那么就不需要更新commitIndex
+		cond1 := majorityIndex > commitIndex
+		cond2 := log[majorityIndex].Term == currentTerm
+		if cond1 && cond2 {
+			rf.commitIndexLock.Lock()
+			rf.lastAppliedLock.Lock()
+			prevCommitIndex := rf.commitIndex
+			rf.commitIndex = majorityIndex
+			rf.lastApplied = rf.commitIndex
+			rf.lastAppliedLock.Unlock()
+			rf.commitIndexLock.Unlock()
+			rf.sendNewlyCommittedLog(prevCommitIndex)
+		}
 	}
 
 	rf.leaderSendAppendEntriesRPC(false)
 }
 
 func (rf *Raft) sendNewlyCommittedLog(prevCommitIndex int) {
-	PrintLog("sendNewlyCommittedLog", "purple", strconv.Itoa(rf.me))
 
 	rf.commitIndexLock.RLock()
 	commitIndex := rf.commitIndex
@@ -383,4 +390,5 @@ func (rf *Raft) sendNewlyCommittedLog(prevCommitIndex int) {
 		// variable (Go's sync.Cond) for this.
 		rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i + 1}
 	}
+	rf.logLock.RUnlock()
 }

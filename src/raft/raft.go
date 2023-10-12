@@ -155,7 +155,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndexLock.Unlock()
 		rf.nextIndexLock.Unlock()
 
-		PrintLog("Leader accept a new log", "blue", strconv.Itoa(rf.me))
+		PrintLog("Leader accepts a new log", "blue", strconv.Itoa(rf.me))
 		rf.PrintRaftLog()
 		// rf.leaderSendAppendEntriesRPC(false)
 	}
@@ -225,7 +225,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastAppliedLock.Unlock()
 
 	// 初始化electionTimeout，设置为550-800ms之间的随机数
-	rf.electionTimeout = 550 + rand.Intn(300)
+	rf.electionTimeout = 500 + rand.Intn(300)
 
 	// 重置一下状态(其实只重置了时钟)
 	rf.toFollower(0)

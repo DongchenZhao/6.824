@@ -43,7 +43,6 @@ func PrintLog(content string, options ...string) {
 }
 
 func (rf *Raft) PrintRaftLog() {
-	PrintLog("PrintRaftLog", "red", strconv.Itoa(rf.me))
 	rf.logLock.RLock()
 	rfLog := make([]LogEntry, len(rf.log))
 	for i := 0; i < len(rf.log); i++ {
@@ -52,7 +51,7 @@ func (rf *Raft) PrintRaftLog() {
 	rf.logLock.RUnlock()
 
 	if len(rfLog) == 0 {
-		PrintLog("[LOG] log empty", "red", strconv.Itoa(rf.me))
+		PrintLog("[SERVER LOG]: EMPTY", "red", strconv.Itoa(rf.me))
 		return
 	}
 

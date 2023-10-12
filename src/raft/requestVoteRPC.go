@@ -46,7 +46,7 @@ func (rf *Raft) RequestVoteReqHandler(args *RequestVoteArgs, reply *RequestVoteR
 	}
 	rf.logLock.RUnlock()
 
-	// 如果自己term更小，无论自己是哪种身份，转为follower，然后刷新term和voteFor
+	// 如果自己term更小，无论自己是哪种身份，转为follower，然后刷新term和voteFor，再继续对当前candidate的投票请求进行研判
 	if args.Term > currentTerm {
 		rf.toFollower(args.Term)
 		currentTerm = args.Term

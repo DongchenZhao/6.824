@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"strconv"
 )
 
@@ -29,7 +28,6 @@ func (rf *Raft) AppendEntriesReqHandler(args *AppendEntriesArgs, reply *AppendEn
 	rf.currentTermLock.RUnlock()
 	reply.ServerId = rf.me
 	if args.Term < currentTerm { // 过期leader，拒绝
-		PrintLog(fmt.Sprintf("Reject AppendEntries RPC from [Leader %d]", args.LeaderId), "yellow", strconv.Itoa(rf.me))
 		reply.Term = currentTerm
 		reply.Success = false
 	} else {
@@ -55,7 +53,7 @@ func (rf *Raft) AppendEntriesReqHandler(args *AppendEntriesArgs, reply *AppendEn
 		commitIndex := rf.commitIndex
 		rf.commitIndexLock.RUnlock()
 
-		// AE RPC中的commitIndex更大，更新rf的commitIndex
+		// AE RPC中的commitIndex更大，更新rf的commitIndex(Figure2中AppendEntriesRPC的5步骤)
 		// 这也避免了rf接收到陈旧AE RPC的情况
 		if args.LeaderCommit > commitIndex {
 			rf.logLock.Lock()
@@ -107,18 +105,16 @@ func (rf *Raft) appendEntriesRespHandler(args *AppendEntriesArgs, reply *AppendE
 	// 陈旧的resp中包含冲突的日志index小于leader知道的对方已匹配日志
 	knownMatchIndex := matchIndex[reply.ServerId]
 	if (!reply.Success) && reply.XIndex < knownMatchIndex {
-		PrintLog(fmt.Sprintf("Expired FAILURE AE RPC response from [Server %d]", reply.ServerId), "yellow", strconv.Itoa(rf.me))
 		return
 	} else if (args.PrevLogIndex + len(args.Entries)) < knownMatchIndex {
-		PrintLog(fmt.Sprintf("Expired SUCCESS AE RPC response from [Server %d]", reply.ServerId), "yellow", strconv.Itoa(rf.me))
 		return
 	}
 
 	// 1. 对方日志太短
 	if !reply.Success && reply.XTerm == -1 {
 		rf.nextIndexLock.Lock()
-		defer rf.nextIndexLock.Unlock()
 		rf.nextIndex[reply.ServerId] = reply.XIndex
+		rf.nextIndexLock.Unlock()
 	}
 	// 2. 日志在prevLogIndex处冲突
 	// 分情况讨论
@@ -139,13 +135,12 @@ func (rf *Raft) appendEntriesRespHandler(args *AppendEntriesArgs, reply *AppendE
 				PrintLog("nextIndex error", "red", strconv.Itoa(rf.me))
 			}
 			rf.nextIndexLock.Lock()
-			defer rf.nextIndexLock.Unlock()
-			rf.nextIndex[reply.ServerId] = nextIndex
-
+			rf.nextIndex[reply.ServerId] = nextIndex + 1 // TODO ?
+			rf.nextIndexLock.Unlock()
 		} else { // 2.2 leader没有term相关信息，nextIndex设置为XIndex
 			rf.nextIndexLock.Lock()
-			defer rf.nextIndexLock.Unlock()
 			rf.nextIndex[reply.ServerId] = reply.XIndex
+			rf.nextIndexLock.Unlock()
 		}
 	}
 	// 3. 对方成功匹配日志
@@ -169,7 +164,6 @@ func (rf *Raft) appendEntriesRespHandler(args *AppendEntriesArgs, reply *AppendE
 			nextIndexStr += strconv.Itoa(rf.nextIndex[i]) + " "
 		}
 		nextIndexStr += "]"
-		PrintLog("AE RPC SUCCESS, nextIndex: "+nextIndexStr, "purple", strconv.Itoa(rf.me))
 		rf.nextIndexLock.RUnlock()
 		// 集群日志同步状态检查会定期触发，这里不需要再触发
 		// TODO
@@ -191,10 +185,8 @@ func (rf *Raft) leaderSendAppendEntriesRPC(isHeartBeat bool) {
 
 	currentTerm := rf.currentTerm
 	leaderCommit := rf.commitIndex
-
 	nextIndex := make([]int, len(rf.nextIndex))
 	copy(nextIndex, rf.nextIndex)
-
 	log := make([]LogEntry, len(rf.log))
 	for i := 0; i < len(rf.log); i++ {
 		log[i].Term = rf.log[i].Term
@@ -221,16 +213,14 @@ func (rf *Raft) leaderSendAppendEntriesRPC(isHeartBeat bool) {
 
 			// 获取要发送的entries
 			var entries []LogEntry
-			if isHeartBeat {
+			if isHeartBeat || prevLogIndex == len(rf.log)-1 { // 本身就是HB或已经是最新日志，当做HB
 				entries = nil
 			} else {
-				if prevLogIndex == len(rf.log)-1 {
-					return
-				}
 				rf.logLock.RLock()
 				entries = make([]LogEntry, len(rf.log)-prevLogIndex-1)
 				for j := prevLogIndex + 1; j < len(rf.log); j++ {
-					entries[j-prevLogIndex-1] = rf.log[j]
+					entries[j-prevLogIndex-1].Term = rf.log[j].Term
+					entries[j-prevLogIndex-1].Command = rf.log[j].Command
 				}
 				rf.logLock.RUnlock()
 			}
@@ -239,8 +229,7 @@ func (rf *Raft) leaderSendAppendEntriesRPC(isHeartBeat bool) {
 			appendEntriesReply := AppendEntriesReply{}
 
 			// 打印消息日志
-			if isHeartBeat {
-				PrintLog("heartbeat send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
+			if isHeartBeat || prevLogIndex == len(rf.log)-1 {
 			} else {
 				// 将entries内容拼成字符串，打印prevLogIndex, prevLogTerm和entriesStr
 				entriesStr := "["

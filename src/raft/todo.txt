@@ -54,7 +54,8 @@ PASS
 - 加速日志回溯优化
     - If a follower does not have prevLogIndex in its log, it should return with conflictIndex = len(log) and conflictTerm = None.
     - If a follower does have prevLogIndex in its log, but the term does not match, it should return conflictTerm = log[prevLogIndex].Term, and then search its log for the first index whose entry has term equal to conflictTerm.
-    - Upon receiving a conflict response, the leader should first search its log for conflictTerm. If it finds an entry in its log with that term, it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
+    - Upon receiving a conflict response, the leader should first search its log for conflictTerm.
+        If it finds an entry in its log with that term, it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
     1 1 2 2 3 3 3 4 4 4 4
     1 1 2 2 3 3 3 3 3 3 3 3 3
     - If it does not find an entry with that term, it should set nextIndex = conflictIndex.
@@ -64,7 +65,6 @@ PASS
     - leader定期检查日志匹配情况，有选择地发送AE RPC
     - leader收到log忘记更新自己的matchIndex了  done
 
-    - 貌似leader更新完自己的日志后，发送到其他server，其他server没有响应
 
     You'll want to have a separate long-running goroutine that sends
     committed log entries in order on the applyCh. It must be separate,
