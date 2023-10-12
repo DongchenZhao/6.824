@@ -63,3 +63,13 @@ PASS
     - XLen 规定不完善
     - leader定期检查日志匹配情况，有选择地发送AE RPC
     - leader收到log忘记更新自己的matchIndex了  done
+
+    - 貌似leader更新完自己的日志后，发送到其他server，其他server没有响应
+
+    You'll want to have a separate long-running goroutine that sends
+    committed log entries in order on the applyCh. It must be separate,
+    since sending on the applyCh can block; and it must be a single
+    goroutine, since otherwise it may be hard to ensure that you send log
+    entries in log order. The code that advances commitIndex will need to
+    kick the apply goroutine; it's probably easiest to use a condition
+    variable (Go's sync.Cond) for this.

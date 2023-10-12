@@ -139,19 +139,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	term, isLeader := rf.GetState()
 	if isLeader {
-		// 更新日志
 		rf.logLock.Lock()
+		rf.matchIndexLock.Lock()
+		rf.nextIndexLock.Lock()
+
+		// 更新日志
 		rf.log = append(rf.log, LogEntry{term, command})
 		index = len(rf.log) - 1
-		rf.logLock.Unlock()
 
 		// 更新nextIndex和matchIndex自己的位置
-		rf.matchIndexLock.Lock()
 		rf.matchIndex[rf.me] = index
-		rf.matchIndexLock.Unlock()
-
-		rf.nextIndexLock.Lock()
 		rf.nextIndex[rf.me] = index + 1
+
+		rf.logLock.Unlock()
+		rf.matchIndexLock.Unlock()
 		rf.nextIndexLock.Unlock()
 
 		PrintLog("Leader accept a new log", "blue", strconv.Itoa(rf.me))
@@ -159,7 +160,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// rf.leaderSendAppendEntriesRPC(false)
 	}
 
-	return index, term, isLeader
+	return index + 1, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,

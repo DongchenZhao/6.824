@@ -172,6 +172,7 @@ func (rf *Raft) appendEntriesRespHandler(args *AppendEntriesArgs, reply *AppendE
 		PrintLog("AE RPC SUCCESS, nextIndex: "+nextIndexStr, "purple", strconv.Itoa(rf.me))
 		rf.nextIndexLock.RUnlock()
 		// 集群日志同步状态检查会定期触发，这里不需要再触发
+		// TODO
 	}
 
 }

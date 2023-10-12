@@ -57,7 +57,7 @@ func (rf *Raft) toCandidate() {
 			if curI == rf.me { // 跳过自己
 				return
 			}
-			PrintLog("RequestVote send to [Server "+strconv.Itoa(curI)+"]", "default", strconv.Itoa(rf.me))
+			PrintLog("RequestVote send to [Server "+strconv.Itoa(curI)+"]"+" term ["+strconv.Itoa(currentTerm)+"]"+" lastLogIndex ["+strconv.Itoa(lastLogIndex)+"]"+" lastLogTerm ["+strconv.Itoa(lastLogTerm)+"]", "default", strconv.Itoa(rf.me))
 			requestVoteArgs := RequestVoteArgs{currentTerm, me, lastLogIndex, lastLogTerm}
 			requestVoteReply := RequestVoteReply{}
 			ok := rf.sendRequestVote(curI, &requestVoteArgs, &requestVoteReply)
@@ -85,7 +85,7 @@ func (rf *Raft) toFollower(term int) {
 
 	rf.role = 0
 	rf.lastHeartbeatTime = time.Now().UnixMilli()
-	if currentTerm != term { // 对方term更新，更新自己的term，重置voteFor，voteCnt
+	if currentTerm < term { // 对方term更新，更新自己的term，重置voteFor，voteCnt
 		PrintLog("-> follower, update term to ["+strconv.Itoa(term)+"], previous term ["+strconv.Itoa(currentTerm)+"]", "green", strconv.Itoa(rf.me))
 
 		rf.currentTermLock.Lock()
@@ -373,6 +373,14 @@ func (rf *Raft) sendNewlyCommittedLog(prevCommitIndex int) {
 	rf.logLock.RLock()
 	for i := prevCommitIndex + 1; i <= commitIndex; i++ {
 		// 发送到kv server
-		rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
+		// TODO 单独goroutine
+		// You'll want to have a separate long-running goroutine that sends
+		// committed log entries in order on the applyCh. It must be separate,
+		// since sending on the applyCh can block; and it must be a single
+		// goroutine, since otherwise it may be hard to ensure that you send log
+		// entries in log order. The code that advances commitIndex will need to
+		// kick the apply goroutine; it's probably easiest to use a condition
+		// variable (Go's sync.Cond) for this.
+		rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i + 1}
 	}
 }
