@@ -1,198 +1,10 @@
 package raft
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
-	"time"
 )
-
-// follower或candidate 超时未收到心跳触发
-// 0. role设置为1
-// 1. 增加currentTerm
-// 2. voteFor设置为自己
-// 3. 重置lastHeartbeatTime
-// 4. 向其他server发送RequestVote RPC
-func (rf *Raft) toCandidate() {
-	rf.roleLock.Lock()
-	rf.role = 1
-	defer rf.roleLock.Unlock()
-
-	// 更新term
-	rf.currentTermLock.Lock()
-	rf.currentTerm++
-	currentTerm := rf.currentTerm
-	defer rf.currentTermLock.Unlock()
-
-	PrintLog("-> candidate start election, candidate term ["+strconv.Itoa(currentTerm)+"]", "green", strconv.Itoa(rf.me))
-
-	// 为自己投票
-	rf.voteForLock.Lock()
-	rf.votedFor = rf.me
-	defer rf.voteForLock.Unlock()
-
-	// 重置lastHeartbeatTime
-	rf.lastHeartbeatTimeLock.Lock()
-	rf.lastHeartbeatTime = time.Now().UnixMilli()
-	defer rf.lastHeartbeatTimeLock.Unlock()
-
-	// 获取当前term，me，lastLogIndex，lastLogTerm，这些都是需要发送给其他server的，对这些数据快照，以防不同server收到不同数据
-	me := rf.me
-	rf.logLock.RLock()
-	var lastLogIndex int
-	var lastLogTerm int
-	if len(rf.log) > 0 {
-		lastLogIndex = len(rf.log) - 1
-		lastLogTerm = rf.log[lastLogIndex].Term
-	} else {
-		lastLogIndex = -1
-		lastLogTerm = currentTerm
-	}
-	rf.logLock.RUnlock()
-
-	// 遍历rf的peer，并发地向每个peer发送RequestVote RPC
-
-	for i := 0; i < len(rf.peers); i++ {
-		curI := i
-		go func() {
-			if curI == rf.me { // 跳过自己
-				return
-			}
-			PrintLog("RequestVote send to [Server "+strconv.Itoa(curI)+"]"+" term ["+strconv.Itoa(currentTerm)+"]"+" lastLogIndex ["+strconv.Itoa(lastLogIndex)+"]"+" lastLogTerm ["+strconv.Itoa(lastLogTerm)+"]", "default", strconv.Itoa(rf.me))
-			requestVoteArgs := RequestVoteArgs{currentTerm, me, lastLogIndex, lastLogTerm}
-			requestVoteReply := RequestVoteReply{}
-			ok := rf.sendRequestVote(curI, &requestVoteArgs, &requestVoteReply)
-			if !ok {
-				PrintLog("RequestVote send to [Server "+strconv.Itoa(curI)+"] failed", "yellow", strconv.Itoa(rf.me))
-			}
-			rf.requestVoteRespHandler(&requestVoteReply)
-		}()
-	}
-}
-
-// leader/candidate/follower发现自己term小于RPC中的term
-// 转为follower，重置lastHeartbeatTime
-// 如果term更新，重置voteFor，currentTerm，voteCnt
-func (rf *Raft) toFollower(term int) {
-	rf.currentTermLock.RLock()
-	currentTerm := rf.currentTerm
-	rf.currentTermLock.RUnlock()
-
-	// 重置role和lastHeartbeatTime
-	rf.roleLock.Lock()
-	defer rf.roleLock.Unlock()
-	rf.lastHeartbeatTimeLock.Lock()
-	defer rf.lastHeartbeatTimeLock.Unlock()
-
-	rf.role = 0
-	rf.lastHeartbeatTime = time.Now().UnixMilli()
-	if currentTerm < term { // 对方term更新，更新自己的term，重置voteFor，voteCnt
-		PrintLog("-> follower, time expired, update term to ["+strconv.Itoa(term)+"], previous term ["+strconv.Itoa(currentTerm)+"]", "green", strconv.Itoa(rf.me))
-
-		rf.currentTermLock.Lock()
-		defer rf.currentTermLock.Unlock()
-		rf.voteForLock.Lock()
-		defer rf.voteForLock.Unlock()
-		rf.voteCntLock.Lock()
-		defer rf.voteCntLock.Unlock()
-
-		rf.currentTerm = term
-		rf.votedFor = -1
-		rf.voteCnt = 0
-	}
-}
-
-func (rf *Raft) toLeader() {
-
-	rf.currentTermLock.RLock()
-	PrintLog("-> leader for term ["+strconv.Itoa(rf.currentTerm)+"]", "green", strconv.Itoa(rf.me))
-	rf.currentTermLock.RUnlock()
-	// 重置一些状态
-	rf.roleLock.Lock()
-	rf.lastHeartbeatTimeLock.Lock()
-	rf.voteForLock.Lock()
-	rf.voteCntLock.Lock()
-	rf.nextIndexLock.Lock()
-	rf.matchIndexLock.Lock()
-	rf.logLock.RLock()
-
-	rf.role = 2
-	rf.lastHeartbeatTime = time.Now().UnixMilli()
-	rf.votedFor = -1
-	rf.voteCnt = 0
-	rf.curLeader = rf.me
-	// 清空nextIndex和matchIndex
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
-	// 初始化nextIndex[]和matchIndex[]
-	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = len(rf.log)
-		rf.matchIndex[i] = -1 // 表示当前leader认为其他server的log为空，(选择初始化为https://thesquareplanet.com/blog/students-guide-to-raft/中的-1而不是论文中的0,貌似因为论文中log index从1开始)
-	}
-
-	rf.roleLock.Unlock()
-	rf.lastHeartbeatTimeLock.Unlock()
-	rf.voteForLock.Unlock()
-	rf.voteCntLock.Unlock()
-	rf.nextIndexLock.Unlock()
-	rf.matchIndexLock.Unlock()
-	rf.logLock.RUnlock()
-
-	// 启动go routine，定期发送心跳包
-	go rf.leaderTick()
-
-}
-
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
-// follower或candidate
-// 定期检查是否heartbeat超时，如果当前server认为自己是leader，那么就不需要进行选举
-// 否则在electionTimeout时间内没有收到心跳包，就开始选举
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
-
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
-
-		time.Sleep(10 * time.Millisecond)
-
-		// 如果当前角色是leader，那么就不需要听心跳
-		rf.roleLock.RLock()
-		role := rf.role
-		rf.roleLock.RUnlock()
-		if role == 2 {
-			continue
-		}
-		// 如果距离上次收到心跳包的时间超过了electionTimeout，那么就需要进行选举
-		rf.lastHeartbeatTimeLock.RLock()
-		lastHeartbeatTime := rf.lastHeartbeatTime
-		rf.lastHeartbeatTimeLock.RUnlock()
-		if lastHeartbeatTime < time.Now().UnixMilli()-int64(rf.electionTimeout) {
-			rf.toCandidate()
-		}
-	}
-}
-
-func (rf *Raft) leaderTick() {
-	for rf.killed() == false {
-		rf.roleLock.RLock()
-		role := rf.role
-		rf.roleLock.RUnlock()
-
-		if role != 2 { // 不再是leader，结束这个go routine
-			PrintLog("No longer leader", "green", strconv.Itoa(rf.me))
-			return
-		}
-
-		// 发送心跳包
-		rf.leaderSendAppendEntriesRPC(true)
-
-		// 检查同步情况，更新commitIndex，发送AE RPC
-		rf.leaderUpdateCommitIndex()
-
-		time.Sleep(150 * time.Millisecond)
-	}
-}
 
 // 匹配leader AE RPC中的prevLogIndex 和 prevLogTerm同当前rf log的情况
 // 1.rf的log在prevLogIndex位置没有条目，返回(false, -1, len(rf.log), len(rf.log))
@@ -229,7 +41,7 @@ func (rf *Raft) compareAndHandleLog(prevLogTerm int, prevLogIndex int, entries [
 		// 如果是心跳包,或者空entries(表示已经和leader同步了),不修改本地日志（也不截断）
 		if len(entries) > 0 { // 空切片len为0
 			rf.logLock.Lock()
-			rf.log = append(log[:prevLogIndex+1], entries...)
+			rf.log = append(rf.log[:prevLogIndex+1], entries...)
 			rf.logLock.Unlock()
 			PrintLog("log compare success, append entries", "blue", strconv.Itoa(rf.me))
 			rf.PrintRaftLog()
@@ -338,24 +150,12 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 		windowLen += 1
 	}
 
-	matchIndexStr := "["
-	for i := 0; i < len(matchIndex); i++ {
-		matchIndexStr += strconv.Itoa(matchIndex[i]) + " "
-	}
-	matchIndexStr += "]"
-	// PrintLog("matchIndex: "+matchIndexStr, "purple", strconv.Itoa(rf.me))
-
-	// leader 仅当majorityIndex更新，且为当前term的时候才会提交
-
-	// PrintLog("majorityIndex: "+strconv.Itoa(majorityIndex)+" commitIndex: "+strconv.Itoa(commitIndex)+" currentTerm: "+strconv.Itoa(currentTerm), "purple", strconv.Itoa(rf.me))
-
-	// leader 发送AE RPC
-	// TODO 单独goroutine
-	// rf.leaderSendAppendEntriesRPC(false)
-
 	if majorityIndex != -1 { // 如果大多数server的日志都为空，那么就不需要更新commitIndex
-		cond1 := majorityIndex > commitIndex
-		cond2 := log[majorityIndex].Term == currentTerm
+
+		// 更新commitIndex的条件
+		// leader 仅当majorityIndex更新，且为当前term的时候才会提交
+		cond1 := majorityIndex > commitIndex            // 条件1: 大多数server的日志都和leader同步了
+		cond2 := log[majorityIndex].Term == currentTerm // 条件2: 大多数server的日志都是当前term的
 		if cond1 && cond2 {
 			rf.commitIndexLock.Lock()
 			rf.lastAppliedLock.Lock()
@@ -364,11 +164,11 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 			rf.lastApplied = rf.commitIndex
 			rf.lastAppliedLock.Unlock()
 			rf.commitIndexLock.Unlock()
+			PrintLog("Leader update commitIndex to ["+strconv.Itoa(majorityIndex)+"]", "red", strconv.Itoa(rf.me))
+			rf.PrintState()
 			rf.sendNewlyCommittedLog(prevCommitIndex)
 		}
 	}
-
-	rf.leaderSendAppendEntriesRPC(false)
 }
 
 func (rf *Raft) sendNewlyCommittedLog(prevCommitIndex int) {
@@ -388,6 +188,8 @@ func (rf *Raft) sendNewlyCommittedLog(prevCommitIndex int) {
 		// entries in log order. The code that advances commitIndex will need to
 		// kick the apply goroutine; it's probably easiest to use a condition
 		// variable (Go's sync.Cond) for this.
+		PrintLog(fmt.Sprint("send newly committed log to kv server, log info: "+rf.LogEntryToStr(i)), "yellow", strconv.Itoa(rf.me))
+
 		rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i + 1}
 	}
 	rf.logLock.RUnlock()

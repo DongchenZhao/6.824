@@ -96,11 +96,12 @@ type Raft struct {
 	voteCntLock           sync.RWMutex
 	curLeaderLock         sync.RWMutex
 	// ------2B ------
-	logLock         sync.RWMutex
-	nextIndexLock   sync.RWMutex
-	matchIndexLock  sync.RWMutex
-	commitIndexLock sync.RWMutex
-	lastAppliedLock sync.RWMutex
+	logLock             sync.RWMutex
+	nextIndexLock       sync.RWMutex
+	matchIndexLock      sync.RWMutex
+	commitIndexLock     sync.RWMutex
+	lastAppliedLock     sync.RWMutex
+	electionTimeoutLock sync.RWMutex
 }
 
 // return currentTerm and whether this server
@@ -224,11 +225,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = -1
 	rf.lastAppliedLock.Unlock()
 
-	// 初始化electionTimeout，设置为550-800ms之间的随机数
-	rf.electionTimeout = 500 + rand.Intn(300)
+	// 初始化electionTimeout，设置为400-600ms之间的随机数
+	rf.electionTimeoutLock.Lock()
+	rf.electionTimeout = 400 + rand.Intn(200)
+	rf.electionTimeoutLock.Unlock()
 
 	// 重置一下状态(其实只重置了时钟)
-	rf.toFollower(0)
+	rf.toFollower(0, true)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

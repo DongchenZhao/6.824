@@ -32,9 +32,8 @@ func (rf *Raft) AppendEntriesReqHandler(args *AppendEntriesArgs, reply *AppendEn
 		reply.Success = false
 	} else {
 		// leader term更大，或两者相等，转为follower（即使当前role已经是follower）
-		// 转化为follower的时候重置了election timer，但上面拒绝leader不会重置election timer
 		// 此时，即使Success=false也不会使leader转为follower，只表示rf和leader日志不匹配
-		rf.toFollower(args.Term)
+		rf.toFollower(args.Term, true)
 		reply.Term = args.Term
 
 		// log replication part
@@ -84,7 +83,7 @@ func (rf *Raft) appendEntriesRespHandler(args *AppendEntriesArgs, reply *AppendE
 	rf.currentTermLock.RUnlock()
 
 	if reply.Term > currentTerm { // 当前server是过期leader，转为follower
-		rf.toFollower(reply.Term)
+		rf.toFollower(reply.Term, true)
 	}
 
 	// 2B part
@@ -157,16 +156,10 @@ func (rf *Raft) appendEntriesRespHandler(args *AppendEntriesArgs, reply *AppendE
 		rf.matchIndex[reply.ServerId] = nextIndex - 1
 		rf.matchIndexLock.Unlock()
 
-		// 将nextIndex转为字符串
-		rf.nextIndexLock.RLock()
-		nextIndexStr := "["
-		for i := 0; i < len(rf.nextIndex); i++ {
-			nextIndexStr += strconv.Itoa(rf.nextIndex[i]) + " "
-		}
-		nextIndexStr += "]"
-		rf.nextIndexLock.RUnlock()
+		// 更新commitIndex
+		// rf.leaderUpdateCommitIndex()
+
 		// 集群日志同步状态检查会定期触发，这里不需要再触发
-		// TODO
 	}
 
 }
@@ -176,7 +169,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-func (rf *Raft) leaderSendAppendEntriesRPC(isHeartBeat bool) {
+func (rf *Raft) leaderSendAppendEntriesRPC() {
 
 	rf.nextIndexLock.RLock()
 	rf.logLock.RLock()
@@ -201,21 +194,19 @@ func (rf *Raft) leaderSendAppendEntriesRPC(isHeartBeat bool) {
 	for i := 0; i < len(rf.peers); i++ {
 		curI := i
 		go func() {
-			if curI == rf.me { // 跳过自己
+			if curI == rf.me {
 				return
 			}
 			//获取要发送的prevLogIndex和prevLogTerm
 			prevLogIndex := nextIndex[curI] - 1
 			prevLogTerm := currentTerm
-			if prevLogIndex >= 0 { // 考虑一开始leader日志为空的情况
+			if prevLogIndex >= 0 { // 考虑一开始leader日志为空的情况，prevLogIndex为0点时候，prevLogTerm为currentTerm
 				prevLogTerm = log[prevLogIndex].Term
 			}
 
 			// 获取要发送的entries
 			var entries []LogEntry
-			if isHeartBeat || prevLogIndex == len(rf.log)-1 { // 本身就是HB或已经是最新日志，当做HB
-				entries = nil
-			} else {
+			if prevLogIndex != len(rf.log)-1 { // prevLogIndex == len(rf.log)-1时，entries为空
 				rf.logLock.RLock()
 				entries = make([]LogEntry, len(rf.log)-prevLogIndex-1)
 				for j := prevLogIndex + 1; j < len(rf.log); j++ {
@@ -229,20 +220,18 @@ func (rf *Raft) leaderSendAppendEntriesRPC(isHeartBeat bool) {
 			appendEntriesReply := AppendEntriesReply{}
 
 			// 打印消息日志
-			if isHeartBeat || prevLogIndex == len(rf.log)-1 {
-			} else {
-				// 将entries内容拼成字符串，打印prevLogIndex, prevLogTerm和entriesStr
-				entriesStr := "["
-				for i := 0; i < len(entries); i++ {
-					entriesStr += strconv.Itoa(entries[i].Term) + " "
-				}
-				entriesStr += "]"
-				PrintLog("Sending appendEntries to [Server "+strconv.Itoa(curI)+"]"+"prevLogIndex: "+strconv.Itoa(prevLogIndex)+" prevLogTerm: "+strconv.Itoa(prevLogTerm)+" entries: "+entriesStr, "purple", strconv.Itoa(rf.me))
+			// 将entries内容拼成字符串，打印prevLogIndex, prevLogTerm和entriesStr
+			entriesStr := "["
+			for i := 0; i < len(entries); i++ {
+				entriesStr += strconv.Itoa(entries[i].Term) + " "
 			}
+			entriesStr += "]"
+			PrintLog("Leader ------> [Server "+strconv.Itoa(curI)+"] {AE RPC} prevLogIndex: "+strconv.Itoa(prevLogIndex)+" prevLogTerm: "+strconv.Itoa(prevLogTerm)+" entries: "+entriesStr, "purple", strconv.Itoa(rf.me))
+			rf.PrintState()
 
 			ok := rf.sendAppendEntries(curI, &appendEntriesArgs, &appendEntriesReply)
 			if !ok {
-				PrintLog("appendEntries send to [Server "+strconv.Itoa(curI)+"] failed", "yellow", strconv.Itoa(rf.me))
+				// PrintLog("appendEntries send to [Server "+strconv.Itoa(curI)+"] failed", "yellow", strconv.Itoa(rf.me))
 			}
 			// 处理心跳包的reply
 			rf.appendEntriesRespHandler(&appendEntriesArgs, &appendEntriesReply)

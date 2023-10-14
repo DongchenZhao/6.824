@@ -27,6 +27,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVoteReqHandler(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// an RPC handler should ignore RPCs with old terms
+	PrintLog("receive vote request from [Server "+strconv.Itoa(args.CandidateId)+"]"+" term ["+strconv.Itoa(args.Term)+"]"+" lastLogIndex ["+strconv.Itoa(args.LastLogIndex)+"]"+" lastLogTerm ["+strconv.Itoa(args.LastLogTerm)+"]", "default", strconv.Itoa(rf.me))
 
 	rf.currentTermLock.RLock()
 	currentTerm := rf.currentTerm
@@ -46,9 +47,13 @@ func (rf *Raft) RequestVoteReqHandler(args *RequestVoteArgs, reply *RequestVoteR
 	}
 	rf.logLock.RUnlock()
 
+	PrintLog("receive vote request from [Server "+strconv.Itoa(args.CandidateId)+"]"+" term ["+strconv.Itoa(args.Term)+"]"+" lastLogIndex ["+strconv.Itoa(args.LastLogIndex)+"]"+" lastLogTerm ["+strconv.Itoa(args.LastLogTerm)+"]", "default", strconv.Itoa(rf.me))
+	rf.PrintState()
+
 	// 如果自己term更小，无论自己是哪种身份，转为follower，然后刷新term和voteFor，再继续对当前candidate的投票请求进行研判
 	if args.Term > currentTerm {
-		rf.toFollower(args.Term)
+		PrintLog(" receive higher term from [Server "+strconv.Itoa(args.CandidateId)+"], converting to follower", "default", strconv.Itoa(rf.me))
+		rf.toFollower(args.Term, false) // 不重置timeout,否则可能出现对方一直增加term，自己一直被“压制”而无法发起选举的情况
 		currentTerm = args.Term
 		votedFor = -1
 	}
@@ -57,6 +62,7 @@ func (rf *Raft) RequestVoteReqHandler(args *RequestVoteArgs, reply *RequestVoteR
 	// 2.如果自己已经投过票，也拒绝投票
 	// 隐含了自己是term更大的leader的情况
 	if args.Term < currentTerm || votedFor != -1 {
+		PrintLog(" refuse to vote for [Server "+strconv.Itoa(args.CandidateId)+"], curTerm higher or already voted", "default", strconv.Itoa(rf.me))
 		reply.Term = currentTerm
 		reply.VoteGranted = false
 		return
@@ -68,6 +74,7 @@ func (rf *Raft) RequestVoteReqHandler(args *RequestVoteArgs, reply *RequestVoteR
 	// 如果自己最后一个log的term和candidate最有一个log的term相同，但自己日志更长，拒绝投票
 	// 这里rf和candidate的term已经相等了
 	if lastLogTerm > args.LastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
+		PrintLog(" refuse to vote for [Server "+strconv.Itoa(args.CandidateId)+"], election restriction", "default", strconv.Itoa(rf.me))
 		reply.Term = args.Term
 		reply.VoteGranted = false
 		return
@@ -110,7 +117,7 @@ func (rf *Raft) requestVoteRespHandler(reply *RequestVoteReply) {
 
 	// 处理reply.VoteGranted false的情况
 	if !reply.VoteGranted && reply.Term > currentTerm {
-		rf.toFollower(reply.Term)
+		rf.toFollower(reply.Term, true) // 其实是否重置计时器无所谓，当前rf在candidate状态下，已经重置过了
 		return
 	}
 
@@ -120,6 +127,9 @@ func (rf *Raft) requestVoteRespHandler(reply *RequestVoteReply) {
 		rf.voteCnt++
 		voteCnt := rf.voteCnt
 		rf.voteCntLock.Unlock()
+
+		PrintLog(" receive vote from [Server ?]"+" term ["+strconv.Itoa(reply.Term)+"]"+" voteCnt ["+strconv.Itoa(voteCnt)+"]", "default", strconv.Itoa(rf.me))
+
 		if voteCnt > len(rf.peers)/2 { // 获得大多数选票，成为leader
 			rf.toLeader()
 		}
@@ -155,5 +165,8 @@ func (rf *Raft) requestVoteRespHandler(reply *RequestVoteReply) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVoteReqHandler", args, reply)
+	if !ok {
+		PrintLog("RequestVote send to [Server "+strconv.Itoa(server)+"] failed", "yellow", strconv.Itoa(rf.me))
+	}
 	return ok
 }
